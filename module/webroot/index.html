@@ -95,7 +95,7 @@
 <div class="row">
   <div class="grow">
     <h1>SD Redirect <span id="version"></span></h1>
-    <div class="sub">Move apps data to your SD card with ease</div>
+    <div class="sub">Move app data to your SD card with ease</div>
   </div>
   <button class="icon" id="btn-settings" title="Settings">
       <svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.61l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.87a.5.5 0 0 0 .12.61l2.03 1.58a7.07 7.07 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.61l1.92 3.32c.12.22.38.3.6.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.42.49.42h3.84c.24 0 .45-.18.49-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.48 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.61l-2.03-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg>
@@ -141,18 +141,18 @@
 
   <h2>Mode</h2>
   <div class="card stack">
-    <div class="row"><div class="grow">Current mode</div><span id="set-mode" class="chip">…</span></div>
-    <p class="sub"><b>Per-app</b> mounts the SD folders into each app process when it starts. It touches nothing
-      global, but the app may look at its folders a few milliseconds before the mount is in place.</p>
+    <div class="row"><div>Current mode</div><span id="set-mode" class="chip">…</span></div>
+    <p class="sub"><b>Per-app</b> mounts the SD folders into each app process when it starts.</p>
     <p class="sub"><b>Global</b> mounts once at boot for the whole system, so other apps such as the Play Store
-      see the redirect too. No race, but experimental.</p>
-    <div class="btns"><button class="primary" id="btn-mode">Switch mode</button></div>
+      see the redirect too.</p>
+    <div class="btns"><button class="primary" id="btn-mode" disabled>Switch mode</button></div>
   </div>
 
   <h2>Troubleshooting</h2>
   <div class="card stack">
-    <p class="sub"><b>Log</b> shows what the module did: redirects, blocked starts, moves and errors.
-      <b>Diagnostics</b> collects device info, storage mounts and the config; send it along when reporting a problem.</p>
+    <p class="sub"><b>Log</b> shows module actions: redirects, blocked starts, moves, errors etc.</p>
+    <p class="sub"><b>Diagnostics</b> collects device info like storage mounts and config.</p>
+    <p class="sub"><b>It's worth sending both when reporting a problem.</b></p>
     <div class="btns">
       <button id="btn-log">Log</button>
       <button id="btn-diag">Diagnostics</button>
@@ -161,8 +161,8 @@
 
   <h2>Module data</h2>
   <div class="card stack">
-    <p class="sub">Undoes every redirect and deletes the app list, pinned SD cards, mode and log, like a fresh
-      install. No app data is deleted.</p>
+    <p class="sub">Clears module data for a fresh start.</p>
+    <p class="sub"><b>App data from SD card is not deleted</b>, you may need to redirect apps once again with <b>"Redirect only"</b>.</p>
     <div class="btns"><button class="danger" id="btn-reset">Clear module data</button></div>
   </div>
 </div>
@@ -336,7 +336,7 @@ function renderConfigured() {
         </div>
         ${stateChip(a)}
       </div>
-      <div class="sub">Pinned to SD ${esc(a.uuid)} · on SD: ${fmtKB(a.sdKB)}</div>
+      <div class="sub">Pinned to SD ${esc(a.uuid)} · Data on SD: ${fmtKB(a.sdKB)}</div>
       ${leftover}
       ${actions}
     </div>`;
@@ -370,7 +370,8 @@ function renderApps() {
 function render() {
   $('mode').textContent = status.mode === 'global' ? 'Global' : 'Per-app';
   $('set-mode').textContent = $('mode').textContent;
-  $('btn-mode').textContent = status.mode === 'global' ? 'Switch to Per-app mode' : 'Switch to Global mode';
+  $('btn-mode').textContent = status.mode === 'global' ? 'Switch to Per-app mode' : 'Switch to Global mode (WIP)';
+  $('btn-mode').disabled = status.mode !== 'global';  // Global mode is still in development; switching back stays allowed
   $('version').textContent = status.version || '';
   $('mode-hint').textContent = status.mode === 'global'
     ? 'Mounted once at boot. No race, experimental.'
@@ -659,7 +660,8 @@ $('configured').addEventListener('click', e => {
   act?.(pkg);
 });
 $('btn-mode').addEventListener('click', async () => {
-  const mode = status.mode === 'global' ? 'ns' : 'global';
+  if (status.mode !== 'global') return;  // Global mode is still in development: only switching back is allowed
+  const mode = 'ns';
   const ok = await dialog(`Switch to ${mode === 'ns' ? 'per-app' : 'global'} mode?`,
     `<p>Redirected apps are force-stopped and the mounts re-applied.</p>`,
     [{ text: 'Cancel', value: false }, { text: 'Switch', cls: 'primary', value: true }]);

@@ -2,7 +2,7 @@
 
 # SD Redirect
 
-Move an Android app's `Android/data` and `Android/obb` folders to your SD card, without the app noticing.
+Move an Android app's `Android/data` and `Android/obb` folders to your SD card, without the app even noticing.
 
 [![Build](https://img.shields.io/github/actions/workflow/status/FadedAtlas/sd-redirect/build.yml?style=for-the-badge)](https://github.com/FadedAtlas/sd-redirect/actions)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=for-the-badge)](LICENSE)
@@ -23,8 +23,7 @@ Works with exFAT and FAT32 cards set up as portable storage (not adopted).
 
 1. Download the zip from [Releases](https://github.com/FadedAtlas/sd-redirect/releases), or
    [build it yourself](#building).
-2. Install it in your root manager and reboot. On APatch, use the **APM** tab, not KPM, and make sure
-   AndroidPatch is installed first (the home screen must not say "Not installed").
+2. Install it in your root manager and reboot.
 
 ## Using it
 
@@ -45,14 +44,11 @@ so you can redirect the app again later without copying.
 Apps whose data this module put on the card get a small SD card icon in the list, even after you stop the
 redirect.
 
-The cogwheel opens Settings, where you can switch the mode, view or save the log and diagnostics, and clear all
-module data.
-
 ## What it protects you from
 
-- **Missing SD card.** Each app is tied to the card it was moved to. If that card isn't inserted, the app is
-  closed on launch and you get a message. It never starts on an empty internal folder, so it can't overwrite
-  your cloud saves with a fresh install.
+- **Missing SD card.** Each app is tied to the card it was moved to via the card's UUID. If that card isn't
+  inserted, the app is closed on launch and you get a message. It will never start on an empty internal folder or
+  with a different SD card inserted.
 - **File names the card can't store.** exFAT and FAT don't allow some characters (`" * : < > ? | \`), names
   ending in a dot, or two names that differ only in case. FAT32 also can't hold files of 4 GB or more. The
   module checks for all of this before moving anything.
@@ -60,16 +56,17 @@ module data.
   match, the copy on the card is removed and the app stays on internal storage.
 - **Interruptions.** You can cancel a move at any time before the internal copy starts being deleted. If the
   phone reboots mid-move, the module cleans up on the next boot.
-- **The app running during a move.** It is kept closed until the move finishes.
+- **The app running during a move.** It is kept closed until the move finishes. If you launch it anyway, a toast
+  message tells you why it cannot run.
 - **Overwriting data on the card.** If the app already has data on the SD card, you are asked before it's
-  replaced. You are asked twice if the card copy is noticeably bigger than the internal one.
+  replaced.
 
 ## Modes
 
 | Mode | How it works | Trade-off |
 |------|--------------|-----------|
 | **Per-app** (`ns`, default) | Sets up the redirect each time the app starts. | Touches nothing else on the system, but there's a tiny chance the app reads its folder a few milliseconds too early. |
-| **Global** | Sets it up once at boot for all apps. | No timing issue, but it's experimental. |
+| **Global** | Sets it up once at boot for all apps. | No timing issue, but it's still in development and can't be turned on from the WebUI yet. |
 
 ## New OBB files from the Play Store
 

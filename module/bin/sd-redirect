@@ -22,6 +22,7 @@ WATCH=5   # seconds between supervisor checks
 HB_MAX=60 # a daemon whose heartbeat is older than this (seconds) is considered frozen
 MSG='SD Redirect: This app is migrated and requires SD card.'
 MSG_STARTED='SD Redirect: {app} runs from SD card'  # {app}: the app's label, filled in by SdRedirectToast
+MSG_MIGRATING="SD Redirect: {app} can't start while its data is being moved. Try again when the move is done."
 KINDS='data obb'  # every configured app has both Android/data/<pkg> and Android/obb/<pkg> redirected
 
 SELF=$(readlink -f "$0")
@@ -296,6 +297,26 @@ notify_missing() {
   ) &
 }
 
+# notify_migrating <pkg>: toast that the app was closed because its data is being moved, falling back to a
+# notification; max once per 15s
+notify_migrating() {
+  local pkg=$1 f=$RUN/mignote.$1 now last
+  now=$(date +%s)
+  last=$(cat "$f" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt 15 ] && return 0
+  echo "$now" > "$f"
+  (
+    if toast "$MSG_MIGRATING" "$pkg"; then
+      log "$pkg: migration toast shown"
+    elif cmd notification post -S bigtext -t 'SD Redirect' "sd-redirect_mig_$pkg" \
+        "SD Redirect: $pkg can't start while its data is being moved. Try again when the move is done." >/dev/null 2>&1; then
+      log "$pkg: migration notification posted"
+    else
+      log "$pkg: could not notify the user"
+    fi
+  ) &
+}
+
 # notify_obb <pkg> <KB>: tell the user that new OBB files are hidden on internal storage (notification, else toast)
 notify_obb() {
   local mb msg
@@ -356,6 +377,7 @@ handle() {
   if migrating_active "$pkg"; then
     # no done marker: the next process of this app is checked again
     kill -9 "$pid" 2>/dev/null && log "$pkg[$pid]: killed, migration in progress"
+    [ -n "$fg" ] && notify_migrating "$pkg"
     rmdir "$RUN/lock.$pid"; return 0
   fi
   if ! sd_mounted "$uuid"; then
@@ -685,9 +707,13 @@ job_alive() {  # job_alive <pkg>: the detached `migrate --bg` job of <pkg> is st
 # migrate_claimed. The caller records its claim in between (migrating.<pkg>, or mjob.<pkg>.pid for --bg), so two
 # starts at the same moment can't both pass the check. The lock is released by itself if the process dies.
 migrate_claim() {
+  local i=0
   exec 7>"$RUN/mlock.$1"
-  $FLOCK -w 10 3 3>&7 2>/dev/null
-  [ $? = 1 ] && { exec 7>&-; echo "a migration of $1 is already starting"; return 1; }  # >1: no flock binary
+  # busybox/toybox flock have no -w, so wait up to 10 s by retrying -n
+  until lock_fd 7; do
+    [ $i -ge 10 ] && { exec 7>&-; echo "a migration of $1 is already starting"; return 1; }
+    i=$((i + 1)); sleep 1
+  done
   if migrating_active "$1" || { [ -z "$MIG_JOB" ] && job_alive "$1"; }; then
     exec 7>&-; echo "a migration of $1 is already running"; return 1
   fi
@@ -1565,13 +1591,14 @@ cmd_save() {
   echo "Saved to Download/$name"
 }
 
-# test-toast <start|missing> [pkg]: show one of the module's toasts now and report what happened
+# test-toast <start|missing|migrating> [pkg]: show one of the module's toasts now and report what happened
 cmd_test_toast() {
   local which=$1 pkg=$2 msg
   case $which in
     start) msg=$MSG_STARTED ;;
     missing) msg=$MSG ;;
-    *) echo "usage: sd-redirect test-toast <start|missing> [pkg]"; return 1 ;;
+    migrating) msg=$MSG_MIGRATING ;;
+    *) echo "usage: sd-redirect test-toast <start|missing|migrating> [pkg]"; return 1 ;;
   esac
   case $pkg in *[!A-Za-z0-9._]*) echo "invalid package name: $pkg"; return 1 ;; esac
   [ -n "$pkg" ] || pkg=android
@@ -1613,8 +1640,8 @@ usage: sd-redirect <command>
   json                       status as JSON (used by the WebUI)
   diag                       dump info for debugging
   save <log|diag>            save the log / diag output to Download/sd-redirect_<log|diagnostics>_<time>.log
-  test-toast <start|missing> [pkg]
-                             show the start / SD-missing toast now (for debugging)
+  test-toast <start|missing|migrating> [pkg]
+                             show the start / SD-missing / migration toast now (for debugging)
   log                        show the log
 
 config: $CONF    log: $LOG
