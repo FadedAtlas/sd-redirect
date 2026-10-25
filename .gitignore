@@ -1,0 +1,4 @@
+build/
+build-cache/
+dist/
+module/bin/sd-redirect-toast.dex

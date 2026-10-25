@@ -1,0 +1,11 @@
+# sd-redirect config  (/data/adb/sd-redirect/config)
+#
+# MODE=ns      inject the bind mount into each process of a listed app (default, safest)
+# MODE=global  mount once in init's namespace before apps start (no race, experimental)
+MODE=ns
+#
+# One package per line followed by the SD volume UUID it is pinned to (as in /mnt/media_rw/).
+# `sd-redirect add <pkg>` fills the UUID in for you. A line without a UUID is pinned to the
+# card mounted at the next start. While the pinned card is missing, the app is blocked.
+#
+#   com.example.game 1A2B-3C4D

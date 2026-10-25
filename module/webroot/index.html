@@ -1,0 +1,788 @@
+<!doctype html>
+<!-- Copyright (C) 2026 FadedAtlas. Licensed under GPL-3.0 (see LICENSE), with an additional attribution
+     term under section 7(b): see "Additional terms" in README.md. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SD Redirect</title>
+<style>
+  :root {
+    --bg: #f6f7fb; --surface: #ffffff; --surface-2: #eef0f6; --text: #1b1d24; --muted: #646a78;
+    --primary: #3557d6; --on-primary: #ffffff; --primary-soft: #dfe6ff;
+    --ok: #1d7a46; --ok-soft: #d8f2e2; --warn: #9a6200; --warn-soft: #fbecc9; --bad: #b3261e; --bad-soft: #fadcd9;
+    --border: #dde1ea; --radius: 16px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111318; --surface: #1b1e25; --surface-2: #252932; --text: #e4e6ee; --muted: #9aa0ae;
+      --primary: #a9bcff; --on-primary: #0e1c55; --primary-soft: #2b3768;
+      --ok: #7fd9a2; --ok-soft: #1c3a29; --warn: #f2c26b; --warn-soft: #3d3018; --bad: #ffb4ab; --bad-soft: #4a201c;
+      --border: #2e333d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+  body { padding: calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 24px); }
+  h1 { font-size: 22px; margin: 4px 0 2px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 22px 4px 8px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .grow { flex: 1; min-width: 0; }
+  .card { background: var(--surface); border-radius: var(--radius); padding: 14px; border: 1px solid var(--border); }
+  .stack > * + * { margin-top: 10px; }
+
+  button { font: inherit; border: 0; border-radius: 999px; padding: 8px 16px; cursor: pointer;
+    background: var(--surface-2); color: var(--text); }
+  button.primary { background: var(--primary); color: var(--on-primary); }
+  button.danger { background: var(--bad-soft); color: var(--bad); }
+  button.icon { padding: 8px; width: 40px; height: 40px; display: grid; place-items: center; }
+  button:disabled { opacity: .5; }
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; }
+
+
+  .chip { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); white-space: nowrap; }
+  .chip.ok { background: var(--ok-soft); color: var(--ok); }
+  .chip.warn { background: var(--warn-soft); color: var(--warn); }
+  .chip.bad { background: var(--bad-soft); color: var(--bad); }
+
+  .icon-img { width: 40px; height: 40px; border-radius: 10px; flex: none; object-fit: cover; background: var(--surface-2);
+    display: grid; place-items: center; font-weight: 600; color: var(--muted); }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pkg { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .search { width: 100%; font: inherit; padding: 11px 16px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); outline: none; }
+  .search:focus { border-color: var(--primary); }
+  .list { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .item { padding: 10px 14px; cursor: pointer; }
+  .item + .item { border-top: 1px solid var(--border); }
+  .item.sel { background: var(--primary-soft); }
+  input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--primary); flex: none; }
+  .empty { padding: 20px; text-align: center; color: var(--muted); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 14px; }
+
+  dialog { border: 0; border-radius: 22px; padding: 20px; background: var(--surface); color: var(--text);
+    width: min(520px, calc(100vw - 32px)); max-height: 85vh; }
+  dialog::backdrop { background: rgb(0 0 0 / .45); }
+  dialog h3 { margin: 0 0 10px; font-size: 18px; }
+  dialog pre { background: var(--surface-2); border-radius: 12px; padding: 10px; font-size: 11.5px; overflow: auto;
+    max-height: 55vh; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  dialog .btns { justify-content: flex-end; margin-top: 16px; }
+
+  #busy { position: fixed; inset: 0; background: rgb(0 0 0 / .35); display: none; place-items: center; z-index: 10; }
+  #busy.on { display: grid; }
+  #busy .card { display: flex; gap: 12px; align-items: center; }
+  .spin { width: 22px; height: 22px; border: 3px solid var(--surface-2); border-top-color: var(--primary); border-radius: 50%; animation: s 0.8s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .bar { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--primary); border-radius: 999px; transition: width .6s; }
+  .bar.ind i { width: 30%; transition: none; animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  svg { width: 20px; height: 20px; fill: currentColor; }
+  .sdmark { display: inline-flex; color: var(--muted); flex: none; }
+  /* full-screen page over the main screen (settings); dialogs and the busy overlay stay above it */
+  .page { position: fixed; inset: 0; z-index: 6; overflow-y: auto; background: var(--bg);
+    padding: calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 24px); }
+  .page[hidden] { display: none; }
+  body.locked { overflow: hidden; }
+  .card p { margin: 0; }</style>
+</head>
+<body>
+
+<div class="row">
+  <div class="grow">
+    <h1>SD Redirect <span id="version"></span></h1>
+    <div class="sub">Move apps data to your SD card with ease</div>
+  </div>
+  <button class="icon" id="btn-settings" title="Settings">
+      <svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.61l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.87a.5.5 0 0 0 .12.61l2.03 1.58a7.07 7.07 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.61l1.92 3.32c.12.22.38.3.6.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.42.49.42h3.84c.24 0 .45-.18.49-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.48 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.61l-2.03-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg>
+  </button>
+  <button class="icon" id="btn-refresh" title="Refresh">
+    <svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+  </button>
+</div>
+
+<h2>Service</h2>
+<div class="card stack">
+  <div class="row">
+    <div class="grow">
+      <div>Mode</div>
+      <div class="sub" id="mode-hint"></div>
+    </div>
+    <span id="mode" class="chip">…</span>
+  </div>
+  <div class="row"><div class="grow">Daemon</div><span id="daemon" class="chip">…</span></div>
+  <div class="row"><div class="grow">SD card</div><span id="sd" class="chip">…</span></div>
+  <div class="btns">
+    <button class="primary" id="btn-apply" title="Re-apply the config and restart the daemon, as at boot">Restart service</button>
+  </div>
+</div>
+
+<h2>Redirected apps</h2>
+<div id="configured" class="stack"></div>
+
+<h2>Add apps</h2>
+<input class="search" id="search" type="search" placeholder="Search apps" autocomplete="off">
+<div class="toolbar">
+  <label class="check"><input type="checkbox" id="show-system"> Show system apps</label>
+</div>
+<div class="list" id="apps"><div class="empty">Loading apps…</div></div>
+
+<div class="page" id="settings" hidden>
+  <div class="row">
+    <button class="icon" id="btn-settings-back" title="Back">
+      <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+    </button>
+    <h1 class="grow">Settings</h1>
+  </div>
+
+  <h2>Mode</h2>
+  <div class="card stack">
+    <div class="row"><div class="grow">Current mode</div><span id="set-mode" class="chip">…</span></div>
+    <p class="sub"><b>Per-app</b> mounts the SD folders into each app process when it starts. It touches nothing
+      global, but the app may look at its folders a few milliseconds before the mount is in place.</p>
+    <p class="sub"><b>Global</b> mounts once at boot for the whole system, so other apps such as the Play Store
+      see the redirect too. No race, but experimental.</p>
+    <div class="btns"><button class="primary" id="btn-mode">Switch mode</button></div>
+  </div>
+
+  <h2>Troubleshooting</h2>
+  <div class="card stack">
+    <p class="sub"><b>Log</b> shows what the module did: redirects, blocked starts, moves and errors.
+      <b>Diagnostics</b> collects device info, storage mounts and the config; send it along when reporting a problem.</p>
+    <div class="btns">
+      <button id="btn-log">Log</button>
+      <button id="btn-diag">Diagnostics</button>
+    </div>
+  </div>
+
+  <h2>Module data</h2>
+  <div class="card stack">
+    <p class="sub">Undoes every redirect and deletes the app list, pinned SD cards, mode and log, like a fresh
+      install. No app data is deleted.</p>
+    <div class="btns"><button class="danger" id="btn-reset">Clear module data</button></div>
+  </div>
+</div>
+
+<dialog id="dlg">
+  <h3 id="dlg-title"></h3>
+  <div id="dlg-body"></div>
+  <div class="btns" id="dlg-btns"></div>
+</dialog>
+
+<div id="busy"><div class="card"><div class="spin"></div><div id="busy-text">Working…</div></div></div>
+
+<script>
+'use strict';
+const CLI = 'sh /data/adb/modules/sd-redirect/bin/sd-redirect';
+const PKG_RE = /^[A-Za-z0-9_.]+$/;
+const hasKsu = typeof window.ksu !== 'undefined';
+
+// ---------------------------------------------------------------- KernelSU / APatch bridge
+let cbCounter = 0;
+function exec(cmd) {
+  return new Promise((resolve, reject) => {
+    if (!hasKsu) return resolve(mockExec(cmd));
+    const name = `sd_redirect_exec_${Date.now()}_${cbCounter++}`;
+    window[name] = (errno, stdout, stderr) => { delete window[name]; resolve({ errno, stdout, stderr }); };
+    try { ksu.exec(cmd, '{}', name); } catch (e) { delete window[name]; reject(e); }
+  });
+}
+function toast(msg) { hasKsu && typeof ksu.toast === 'function' ? ksu.toast(msg) : console.log(msg); }
+
+async function loadPackages() {
+  let pkgs = null;
+  if (hasKsu && typeof ksu.listPackages === 'function') {
+    try { pkgs = JSON.parse(ksu.listPackages('all')); } catch {}
+  }
+  if (!pkgs) {
+    const r = await exec('pm list packages');
+    pkgs = r.stdout.split('\n').map(l => l.trim().replace(/^package:/, '')).filter(Boolean);
+  }
+  let infos = null;
+  if (hasKsu && typeof ksu.getPackagesInfo === 'function') {
+    try { infos = JSON.parse(ksu.getPackagesInfo(JSON.stringify(pkgs))); } catch {}
+  }
+  if (infos) {
+    return pkgs.map((p, i) => ({ pkg: p, label: infos[i]?.appLabel || p, system: !!infos[i]?.isSystem }));
+  }
+  // No package-info API: use pm to tell user apps from system apps, labels fall back to package names.
+  const user = new Set((await exec('pm list packages -3')).stdout.split('\n').map(l => l.trim().replace(/^package:/, '')));
+  return pkgs.map(p => ({ pkg: p, label: p, system: !user.has(p) }));
+}
+
+// ---------------------------------------------------------------- state
+let status = { mode: 'ns', daemon: false, sd: [], apps: [], jobs: [], sdData: [] };
+let packages = [];
+const jobs = new Map();  // pkg -> last progress { st, rc, phase, done, total }, while a migration is followed
+const labelOf = pkg => packages.find(a => a.pkg === pkg)?.label || pkg;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function fmtKB(kb) {
+  if (kb < 0) return '—';
+  if (kb < 1024) return `${kb} KB`;
+  if (kb < 1048576) return `${(kb / 1024).toFixed(1)} MB`;
+  return `${(kb / 1048576).toFixed(2)} GB`;
+}
+
+async function busy(text, fn) {
+  $('busy-text').textContent = text;
+  $('busy').classList.add('on');
+  try { return await fn(); } finally { $('busy').classList.remove('on'); }
+}
+
+async function cli(args) {
+  const r = await exec(`${CLI} ${args} 2>&1`);
+  return { ok: r.errno === 0, out: (r.stdout || '') + (r.stderr || '') };
+}
+
+async function refreshStatus() {
+  const r = await exec(`${CLI} json`);
+  try { status = JSON.parse(r.stdout); }
+  catch { toast('Failed to read status'); console.error(r); }
+  // follow --bg jobs and migrations started from the shell, also ones begun before the WebUI was opened
+  for (const pkg of [...(status.jobs || []), ...status.apps.filter(a => a.state === 'migrating').map(a => a.pkg)]) {
+    if (PKG_RE.test(pkg) && !jobs.has(pkg)) jobs.set(pkg, { phase: 'start' });
+  }
+  render();
+  if (jobs.size) pollJobs();
+}
+
+// ---------------------------------------------------------------- dialogs
+// Dialogs are queued: a migration result may arrive while another dialog is open.
+let dlgQueue = Promise.resolve();
+function dialog(title, bodyHtml, buttons) {
+  const p = dlgQueue.then(() => openDialog(title, bodyHtml, buttons));
+  dlgQueue = p.catch(() => {});
+  return p;
+}
+function openDialog(title, bodyHtml, buttons) {
+  return new Promise(resolve => {
+    const d = $('dlg');
+    $('dlg-title').textContent = title;
+    $('dlg-body').innerHTML = bodyHtml;
+    const box = $('dlg-btns');
+    box.innerHTML = '';
+    for (const b of buttons) {
+      const el = document.createElement('button');
+      el.textContent = b.text;
+      if (b.cls) el.className = b.cls;
+      el.onclick = () => { d.close(); resolve(b.value); };
+      box.appendChild(el);
+    }
+    d.oncancel = () => resolve(null);
+    d.showModal();
+  });
+}
+const showOutput = (title, text) =>
+  dialog(title, `<pre>${esc(text.trim() || '(empty)')}</pre>`, [{ text: 'Close', cls: 'primary', value: true }]);
+
+// ---------------------------------------------------------------- rendering
+function appIcon(pkg) {
+  const letter = esc((labelOf(pkg)[0] || '?').toUpperCase());
+  return `<img class="icon-img" src="ksu://icon/${esc(pkg)}" alt="" loading="lazy"
+    onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'icon-img',textContent:'${letter}'}))">`;
+}
+
+function stateChip(a) {
+  if (a.state === 'nosd') return `<span class="chip bad">SD ${esc(a.uuid)} missing · blocked</span>`;
+  if (a.state === 'migrating') return '<span class="chip warn">Migrating · blocked</span>';
+  if (status.mode === 'global') {
+    return a.state === 'on' ? '<span class="chip ok">Redirected</span>' : '<span class="chip bad">Not mounted</span>';
+  }
+  if (a.procs === 0) return '<span class="chip">Not running</span>';
+  if (a.redirected === a.procs) return `<span class="chip ok">Redirected (${a.procs})</span>`;
+  return `<span class="chip bad">${a.redirected}/${a.procs} redirected</span>`;
+}
+
+function renderConfigured() {
+  const box = $('configured');
+  if (!status.apps.length) {
+    box.innerHTML = '<div class="card empty">No apps yet. Pick one below.</div>';
+    return;
+  }
+  box.innerHTML = status.apps.map(a => {
+    // only offer a move when internal storage holds data the redirect hides; after a migration it is empty.
+    // New OBB files alone (a Play Store download) get the OBB-only merge, which leaves the SD data alone.
+    const obbKB = a.intObbKB || 0;
+    const hasInternal = a.intKB - obbKB > 64;
+    const hasObb = obbKB > 0 && a.state !== 'nosd';
+    const leftover = jobs.has(a.pkg) ? ''
+      : hasInternal ? `<div class="sub"><span class="chip warn">Internal copy: ${fmtKB(a.intKB)}</span> hidden while redirected</div>`
+      : hasObb ? `<div class="sub"><span class="chip warn">New OBB files: ${fmtKB(obbKB)}</span> on internal storage, hidden while redirected</div>`
+      : '';
+    const actions = jobs.has(a.pkg) ? `
+      <div class="prog stack">
+        <div class="bar ind"><i></i></div>
+        <div class="row"><div class="sub grow prog-text">Starting…</div>
+          <button class="danger" data-act="cancel">Cancel</button></div>
+      </div>` : `
+      <div class="btns">
+        ${hasInternal ? '<button data-act="migrate">Move internal copy to SD</button>'
+          : hasObb ? '<button class="primary" data-act="obb">Move new OBB to SD</button>' : ''}
+        <button class="danger" data-act="remove">Stop redirect</button>
+      </div>`;
+    return `
+    <div class="card stack" data-pkg="${esc(a.pkg)}">
+      <div class="row">
+        ${appIcon(a.pkg)}
+        <div class="grow">
+          <div class="name">${esc(labelOf(a.pkg))}</div>
+          <div class="pkg">${esc(a.pkg)}</div>
+        </div>
+        ${stateChip(a)}
+      </div>
+      <div class="sub">Pinned to SD ${esc(a.uuid)} · on SD: ${fmtKB(a.sdKB)}</div>
+      ${leftover}
+      ${actions}
+    </div>`;
+  }).join('');
+  for (const pkg of jobs.keys()) showProgress(pkg);
+}
+
+const SD_ICON = '<svg viewBox="0 0 24 24"><path d="M18 2h-8L4.02 8 4 20c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-6 6h-2V4h2v4zm3 0h-2V4h2v4zm3 0h-2V4h2v4z"/></svg>';
+
+function renderApps() {
+  const q = $('search').value.trim().toLowerCase();
+  const showSys = $('show-system').checked;
+  const configured = new Set(status.apps.map(a => a.pkg));
+  const onSd = new Set(status.sdData || []);  // data this module moved or kept on a card
+  const sdMark = pkg => onSd.has(pkg) ? `<span class="sdmark" title="Redirected data on the SD card">${SD_ICON}</span>` : '';
+  const list = packages
+    .filter(a => showSys || !a.system || configured.has(a.pkg))
+    .filter(a => !q || a.label.toLowerCase().includes(q) || a.pkg.toLowerCase().includes(q))
+    .sort((a, b) => (configured.has(b.pkg) - configured.has(a.pkg)) || a.label.localeCompare(b.label));
+  const box = $('apps');
+  if (!list.length) { box.innerHTML = '<div class="empty">No apps match.</div>'; return; }
+  box.innerHTML = list.map(a => `
+    <div class="item row${configured.has(a.pkg) ? ' sel' : ''}" data-pkg="${esc(a.pkg)}">
+      ${appIcon(a.pkg)}
+      <div class="grow"><div class="name">${esc(a.label)}</div><div class="pkg">${esc(a.pkg)}</div></div>
+      ${sdMark(a.pkg)}
+      <input type="checkbox" tabindex="-1" ${configured.has(a.pkg) ? 'checked' : ''}>
+    </div>`).join('');
+}
+
+function render() {
+  $('mode').textContent = status.mode === 'global' ? 'Global' : 'Per-app';
+  $('set-mode').textContent = $('mode').textContent;
+  $('btn-mode').textContent = status.mode === 'global' ? 'Switch to Per-app mode' : 'Switch to Global mode';
+  $('version').textContent = status.version || '';
+  $('mode-hint').textContent = status.mode === 'global'
+    ? 'Mounted once at boot. No race, experimental.'
+    : 'Mounted into each app process when it starts.';
+  const d = $('daemon');
+  const [cls, txt] = !status.daemon ? ['bad', status.supervisor ? 'Restarting' : 'Stopped']
+    : status.frozen ? ['bad', 'Frozen']
+    : !status.supervisor ? ['warn', 'Running · unsupervised']
+    : ['ok', 'Running'];
+  d.className = `chip ${cls}`;
+  d.textContent = txt;
+  const sd = $('sd');
+  sd.className = `chip ${status.sd.length ? 'ok' : 'bad'}`;
+  sd.textContent = status.sd.length ? status.sd.join(', ') : 'Not mounted';
+  renderConfigured();
+  renderApps();
+}
+
+// ---------------------------------------------------------------- actions
+async function addApp(pkg) {
+  if (!PKG_RE.test(pkg)) return;
+  const choice = await dialog(`Redirect ${labelOf(pkg)}?`,
+    `<p>The app will be force-stopped. Its folders <b>Android/data/${esc(pkg)}</b> and <b>Android/obb/${esc(pkg)}</b>
+       will be served from the SD card.</p>
+     <p class="sub">It is pinned to the SD card inserted now (${esc(status.sd[0] || 'none')}). Without that card the app
+       is blocked from starting. Data already on internal storage gets hidden, so move it to keep using it.</p>`,
+    [{ text: 'Cancel', value: null }, { text: 'Redirect only', value: 'add' },
+     { text: 'Redirect & move data', cls: 'primary', value: 'move' }]);
+  if (!choice) return;
+  // Check before adding, so an app whose data can't live on the SD card is never redirected.
+  if (choice === 'move' && !(await precheck(pkg))) return;
+  const r = await busy('Adding…', () => cli(`add ${pkg}`));
+  if (!r.ok) { await showOutput('Add failed', r.out); return refreshStatus(); }
+  await refreshStatus();
+  if (choice !== 'move') return toast(`${pkg} redirected`);
+  // The redirect exists only for the move: if it doesn't start, undo it (pollJob does the same if it fails),
+  // otherwise the app would see an empty or stale SD folder with its real data hidden.
+  if (!(await migrate(pkg, true, true))) await undoAdd(pkg);
+}
+
+async function undoAdd(pkg) {
+  const r = await cli(`remove ${pkg}`);
+  if (!r.ok) await showOutput('Undoing the redirect failed', r.out);
+  await refreshStatus();
+}
+
+// precheck: names/file types the SD card's filesystem can't store. Read-only.
+async function precheck(pkg) {
+  const r = await busy('Checking files…', () => cli(`check ${pkg}`));
+  if (r.ok) return true;
+  await showOutput(`${labelOf(pkg)} can't be moved yet`,
+    `${r.out}\nNothing was changed. Rename or remove these entries first.`);
+  return false;
+}
+
+// migrate: true once the background job has started. fresh = the app was just added for this move.
+async function migrate(pkg, checked, fresh) {
+  if (!checked && !(await precheck(pkg))) return false;
+  const app = status.apps.find(a => a.pkg === pkg);
+  let del = true;
+  if (!checked) {
+    const c = await dialog(`Move data of ${labelOf(pkg)}`,
+      `<p>Copies the internal <b>Android/data/${esc(pkg)}</b> and <b>Android/obb/${esc(pkg)}</b> to the SD card and
+       verifies them (file count and sizes).
+       The app is stopped and kept closed until it finishes.</p>`,
+      [{ text: 'Cancel', value: null }, { text: 'Copy, keep internal', value: 'keep' },
+       { text: 'Move', cls: 'primary', value: 'move' }]);
+    if (!c) return false;
+    del = c === 'move';
+  }
+  let replace = false;
+  if (app && !app.sdEmpty) {
+    replace = await dialog('Replace data on the SD card?',
+      `<p>The SD folder already contains <b>${fmtKB(app.sdKB)}</b>. It will be <b>deleted</b> and replaced with
+       the internal data (${fmtKB(app.intKB)}).</p>`,
+      [{ text: 'Cancel', value: false }, { text: 'Delete & replace', cls: 'danger', value: true }]);
+    if (!replace) return false;
+    // Second check when the SD copy is the bigger one: the internal data may be a fresh, almost empty install
+    // (or legitimately smaller, e.g. a newer version). The 10% margin absorbs exFAT's cluster overhead,
+    // which makes the same data look bigger on the card.
+    const intKB = Math.max(app.intKB, 0);
+    if (app.intKB >= 0 && app.sdKB > intKB * 1.1 + 1024) {
+      const sure = await dialog('The SD copy is bigger',
+        `<p>The SD card holds <b>${fmtKB(app.sdKB)}</b> for ${esc(labelOf(pkg))}, but internal storage only
+         <b>${fmtKB(intKB)}</b>. Replacing throws away the bigger copy.</p>
+         <p class="sub">Only continue if the internal data is the one to keep, for example after an update that
+         made the app's files smaller. ${fresh
+           ? 'To use the SD data as it is, cancel and add the app with <b>Redirect only</b>.'
+           : 'Cancel to keep using the SD data as it is.'}</p>`,
+        [{ text: 'Cancel', value: false }, { text: 'Replace anyway', cls: 'danger', value: true }]);
+      if (!sure) return false;
+    }
+  }
+  // Runs detached; the card shows the progress and a Cancel button, the UI stays usable.
+  const r = await cli(`migrate ${pkg}${del ? ' --delete' : ''}${replace ? ' --replace' : ''} --bg`);
+  if (!r.ok) { await showOutput('Move failed', r.out); await refreshStatus(); return false; }
+  jobs.set(pkg, { phase: 'start', fresh });
+  await refreshStatus();
+  return true;
+}
+
+// migrateBack: SD -> internal; the job stops the redirect itself once the internal copy is verified
+async function migrateBack(pkg, app) {
+  let replace = false;
+  if (app.intKB > 64) {
+    replace = await dialog('Replace data on internal storage?',
+      `<p>Internal storage already holds <b>${fmtKB(app.intKB)}</b> for ${esc(labelOf(pkg))}, hidden while redirected.
+       It will be <b>deleted</b> and replaced with the SD data (${fmtKB(app.sdKB)}).</p>`,
+      [{ text: 'Cancel', value: false }, { text: 'Delete & replace', cls: 'danger', value: true }]);
+    if (!replace) return;
+  }
+  const r = await cli(`migrate-back ${pkg}${replace ? ' --replace' : ''} --bg`);
+  if (!r.ok) { await showOutput('Moving back failed', r.out); return refreshStatus(); }
+  jobs.set(pkg, { phase: 'start', back: true });
+  await refreshStatus();
+}
+
+// migrateObb: merge new OBB files (e.g. a Play Store download hidden by the redirect) into the SD obb folder
+async function migrateObb(pkg) {
+  const app = status.apps.find(a => a.pkg === pkg);
+  if (!app) return;
+  const ok = await dialog(`Move new OBB files of ${labelOf(pkg)}?`,
+    `<p>Internal storage holds <b>${fmtKB(app.intObbKB)}</b> of OBB files for ${esc(labelOf(pkg))}, usually a Play Store
+     download. The app can't see them while it is redirected.</p>
+     <ul>
+       <li>They are copied to the SD card and verified, then put into its OBB folder. Files with the same name are
+         replaced, and older versions they update (<code>main.&lt;version&gt;…obb</code>) are deleted.</li>
+       <li>Nothing else on the SD card changes, and the app stays redirected.</li>
+       <li>The app is stopped and kept closed until it finishes.</li>
+     </ul>`,
+    [{ text: 'Cancel', value: false }, { text: 'Move', cls: 'primary', value: true }]);
+  if (!ok) return;
+  const r = await cli(`migrate-obb ${pkg} --bg`);
+  if (!r.ok) { await showOutput('Moving OBB files failed', r.out); return refreshStatus(); }
+  jobs.set(pkg, { phase: 'start', obb: true });
+  await refreshStatus();
+}
+
+// ---------------------------------------------------------------- migration progress
+const PHASES = {
+  start: 'Starting…', check: 'Checking files…', space: 'Calculating size…', clear: 'Deleting old SD data…',
+  verify: 'Verifying…', delete: 'Deleting internal copy…', cleanup: 'Cancelling: removing partial SD copy…',
+};
+const PHASES_BACK = {
+  ...PHASES, clear: 'Deleting old internal data…', verify: 'Verifying, then giving the files to the app…',
+  delete: 'Deleting SD copy…', cleanup: 'Cancelling: removing partial internal copy…',
+};
+const PHASES_OBB = {
+  ...PHASES, commit: 'Putting the new files in place…', cleanup: 'Cancelling: removing partial copy…',
+};
+const phasesOf = j => j.back ? PHASES_BACK : j.obb ? PHASES_OBB : PHASES;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function showProgress(pkg) {
+  const card = document.querySelector(`#configured [data-pkg="${pkg}"]`);
+  const j = jobs.get(pkg);
+  if (!card || !j) return;
+  const bar = card.querySelector('.bar'), text = card.querySelector('.prog-text'), btn = card.querySelector('[data-act="cancel"]');
+  if (!bar) return;  // card rendered before the job was known; the next render adds the bar
+  const copying = j.phase === 'copy' && j.total > 0;
+  const pct = copying ? Math.min(99, Math.floor(j.done * 100 / j.total)) : 0;
+  bar.classList.toggle('ind', !copying);
+  bar.firstElementChild.style.width = copying ? `${pct}%` : '';
+  text.textContent = j.cancelling && j.phase !== 'cleanup' ? 'Cancelling…'
+    : copying ? `Copying ${fmtKB(Math.min(j.done, j.total))} of ${fmtKB(j.total)} · ${pct}% · ${eta(j)}`
+    : phasesOf(j)[j.phase] || j.phase;
+  // once verified the files are being put in place / the source copy deleted; cancelling is no longer possible
+  btn.hidden = j.cancelling || ['commit', 'delete', 'cleanup'].includes(j.phase);
+}
+
+// eta: "12.3 MB/s · ~4 min left" from the sampled copy speed (copy only; verifying comes on top)
+function eta(j) {
+  const s = j.samples || [], a = s[0], b = s[s.length - 1];
+  const secs = a && b ? (b.t - a.t) / 1000 : 0;
+  if (secs < 3 || b.done <= a.done) return 'estimating…';
+  const rate = (b.done - a.done) / secs;  // KB/s
+  const left = Math.max(0, j.total - b.done) / rate;
+  const t = left < 60 ? `${Math.max(1, Math.round(left))} s`
+    : left < 3600 ? `${Math.round(left / 60)} min`
+    : `${Math.floor(left / 3600)} h ${Math.round(left % 3600 / 60)} min`;
+  return `${fmtKB(Math.round(rate))}/s · ~${t} left`;
+}
+
+let polling = false;
+async function pollJobs() {
+  if (polling) return;
+  polling = true;
+  try {
+    while (jobs.size) {
+      for (const pkg of [...jobs.keys()]) await pollJob(pkg);
+      await sleep(1000);
+    }
+  } finally { polling = false; }
+}
+
+async function pollJob(pkg) {
+  const r = await exec(`${CLI} progress ${pkg}`);
+  const [head, ...rest] = (r.stdout || '').split('\n');
+  const [st, rc, phase, done, total, dir] = head.trim().split(/\s+/);
+  const j = jobs.get(pkg);
+  if (!st || !j) return;
+  if (st === 'running') {
+    Object.assign(j, { phase, done: +done, total: +total });
+    if (dir === 'back') j.back = true;  // also for a job found after reopening the WebUI
+    if (dir === 'obb') j.obb = true;
+    // copy speed over the last ~20 s, for the time estimate
+    if (phase === 'copy') {
+      const now = Date.now();
+      j.samples = (j.samples || []).filter(s => now - s.t <= 20000);
+      j.samples.push({ t: now, done: +done });
+    }
+    return showProgress(pkg);
+  }
+  jobs.delete(pkg);
+  await cli(`progress ${pkg} --clear`);
+  // a failed copy already undid the redirect; early refusals (exit 1/3/4 before copying) leave it
+  await refreshStatus();
+  if (j.fresh && rc !== '0' && status.apps.some(a => a.pkg === pkg)) await undoAdd(pkg);
+  if (st === 'none') return;  // a migration started from the shell: its output went there
+  const out = rest.join('\n');
+  const title = st === 'died' ? 'Move stopped unexpectedly'
+    : j.back ? (rc === '0' ? 'Data moved back' : rc === '4' ? 'Moving back cancelled' : 'Moving back failed')
+    : j.obb ? (rc === '0' ? 'OBB files moved' : rc === '4' ? 'Moving OBB files cancelled' : 'Moving OBB files failed')
+    : rc === '0' ? 'Data moved' : rc === '4' ? 'Move cancelled' : 'Move failed';
+  showOutput(`${title}: ${labelOf(pkg)}`, out);  // not awaited: queued behind any open dialog
+}
+
+async function cancelMigration(pkg) {
+  const ok = await dialog(`Cancel moving ${labelOf(pkg)}?`, jobs.get(pkg)?.back
+    ? `<p>The copy is stopped. Anything already copied to internal storage is removed and the app stays redirected
+       to the SD card, where its data is untouched.</p>`
+    : jobs.get(pkg)?.obb
+    ? `<p>The copy is stopped. The partial copy is removed; the OBB files stay on internal storage and nothing on
+       the SD card changes.</p>`
+    : `<p>The copy is stopped. Anything already copied to the SD card is removed and the app goes back to internal
+     storage, where its data is untouched.</p>`,
+    [{ text: 'Keep going', value: false }, { text: 'Cancel move', cls: 'danger', value: true }]);
+  const j = jobs.get(pkg);
+  if (!ok || !j) return;
+  const r = await cli(`cancel ${pkg}`);
+  if (!r.ok) return showOutput('Cancel failed', r.out);
+  j.cancelling = true;
+  showProgress(pkg);
+}
+
+async function removeApp(pkg) {
+  const ok = await dialog(`Stop redirecting ${labelOf(pkg)}?`,
+    `<p>The app goes back to internal storage.</p>`,
+    [{ text: 'Cancel', value: false }, { text: 'Stop redirect', cls: 'danger', value: true }]);
+  if (!ok) return;
+  const app = status.apps.find(a => a.pkg === pkg);
+  if (app && !app.sdEmpty && app.state !== 'nosd') {
+    const intKB = Math.max(app.intKB, 0);
+    const how = await dialog('Move data back to internal storage?',
+      `<p>The SD card holds <b>${fmtKB(app.sdKB)}</b> for ${esc(labelOf(pkg))}.</p>
+       <ul>
+         <li><b>Move data back</b> copies it to internal storage and verifies it. Only then is the redirect stopped
+           and the SD copy deleted. The app is kept closed until it finishes.</li>
+         <li><b>Keep on SD card</b> stops the redirect now. The app starts with what is on internal storage
+           (${intKB > 64 ? fmtKB(intKB) : 'nothing'}); its SD data stays on the card for a later
+           <b>Redirect only</b>.</li>
+       </ul>`,
+      [{ text: 'Cancel', value: null }, { text: 'Keep on SD card', value: 'keep' },
+       { text: 'Move data back', cls: 'primary', value: 'back' }]);
+    if (!how) return;
+    if (how === 'back') return migrateBack(pkg, app);
+  }
+  const r = await busy('Removing…', () => cli(`remove ${pkg}`));
+  if (!r.ok) await showOutput('Remove failed', r.out); else toast(`${pkg} removed`);
+  await refreshStatus();
+}
+
+$('apps').addEventListener('click', e => {
+  const item = e.target.closest('.item');
+  if (!item) return;
+  e.preventDefault();
+  const pkg = item.dataset.pkg;
+  if (jobs.has(pkg)) return toast('Migration in progress');
+  status.apps.some(a => a.pkg === pkg) ? removeApp(pkg) : addApp(pkg);
+});
+$('configured').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const pkg = btn.closest('[data-pkg]').dataset.pkg;
+  const act = { migrate, obb: migrateObb, remove: removeApp, cancel: cancelMigration }[btn.dataset.act];
+  act?.(pkg);
+});
+$('btn-mode').addEventListener('click', async () => {
+  const mode = status.mode === 'global' ? 'ns' : 'global';
+  const ok = await dialog(`Switch to ${mode === 'ns' ? 'per-app' : 'global'} mode?`,
+    `<p>Redirected apps are force-stopped and the mounts re-applied.</p>`,
+    [{ text: 'Cancel', value: false }, { text: 'Switch', cls: 'primary', value: true }]);
+  if (!ok) return;
+  const r = await busy('Switching mode…', () => cli(`set-mode ${mode}`));
+  if (!r.ok) await showOutput('Switch failed', r.out); else toast(`Mode: ${mode}`);
+  await refreshStatus();
+});
+$('btn-apply').onclick = async () => {
+  const r = await busy('Restarting service…', () => cli('restart'));
+  toast(r.out.trim().split('\n').pop() || 'Done');
+  await refreshStatus();
+};
+// showSavable: output dialog with a Save button; `save <what>` writes the full file to Download (the dialog may be
+// trimmed) and the result is shown as a toast
+async function showSavable(title, text, what) {
+  const save = await dialog(title, `<pre>${esc(text.trim() || '(empty)')}</pre>`,
+    [{ text: 'Save to Download', value: true }, { text: 'Close', cls: 'primary', value: false }]);
+  if (!save) return;
+  const r = await busy('Saving…', () => cli(`save ${what}`));
+  r.ok ? toast(r.out.trim()) : showOutput('Saving failed', r.out);
+}
+$('btn-log').onclick = async () =>
+  showSavable('Log', (await cli('log')).out.split('\n').slice(-200).join('\n'), 'log');
+$('btn-diag').onclick = async () =>
+  showSavable('Diagnostics', (await busy('Collecting…', () => cli('diag'))).out, 'diag');
+$('btn-reset').onclick = async () => {
+  if (jobs.size) return toast('Cancel the running migration first');
+  const ok = await dialog('Clear module data?',
+    `<p>Like clearing an Android app's data: the module goes back to a fresh install.</p>
+     <ul>
+       <li><b>Every redirect is undone.</b> Redirected apps are force-stopped.</li>
+       <li><b>Moved apps lose their data until redirected again.</b> They start with whatever is on internal
+         storage, which is usually nothing, and may download their data again.</li>
+       <li>The app list, pinned SD cards, mode (back to Per-app) and log are deleted.</li>
+     </ul>
+     <p class="sub">No app data is deleted: data on the SD card stays there and keeps its SD icon. To use it again,
+     add the app with "Redirect only".</p>`,
+    [{ text: 'Cancel', value: false }, { text: 'Reset', cls: 'danger', value: true }]);
+  if (!ok) return;
+  const r = await busy('Resetting…', () => cli('reset'));
+  await showOutput(r.ok ? 'Module data cleared' : 'Reset failed', r.out);
+  await refreshStatus();
+};
+$('btn-refresh').onclick =() => busy('Refreshing…', refreshStatus);
+// settings page (cogwheel): a history entry, so Android's back gesture closes it instead of leaving the WebUI
+function openSettings() {
+  if (!$('settings').hidden) return;
+  $('settings').hidden = false;
+  document.body.classList.add('locked');
+  history.pushState({ settings: true }, '');
+}
+function closeSettings() {
+  $('settings').hidden = true;
+  document.body.classList.remove('locked');
+}
+$('btn-settings').onclick = openSettings;
+$('btn-settings-back').onclick = () => history.state?.settings ? history.back() : closeSettings();
+window.addEventListener('popstate', closeSettings);
+$('search').addEventListener('input', renderApps);
+$('show-system').addEventListener('change', renderApps);
+
+// ---------------------------------------------------------------- browser preview (no ksu bridge)
+let mockJob = null, mockObbDone = false;
+function mockExec(cmd) {
+  const save = cmd.match(/ save (log|diag)$/);
+  if (save) return { errno: 0, stderr: '', stdout:
+    `Saved to Download/sd-redirect_${save[1] === 'log' ? 'log' : 'diagnostics'}_20261025-171500.log` };
+  if (cmd.endsWith(' json')) return { errno: 0, stderr: '', stdout: JSON.stringify({
+    version: 'dev', mode: 'ns', daemon: true, frozen: false, supervisor: true, sd: ['1A2B-3C4D'],
+    apps: [
+      { pkg: 'com.example.game', uuid: '1A2B-3C4D', sdKB: 4404019, intKB: 2048, intObbKB: 0, sdEmpty: false, state: 'off', procs: 1, redirected: 1 },
+      { pkg: 'com.example.racer', uuid: '1A2B-3C4D', sdKB: 1835008, intKB: mockObbDone ? 0 : 1048576,
+        intObbKB: mockObbDone ? 0 : 1048576, sdEmpty: false, state: 'off', procs: 0, redirected: 0 },
+      { pkg: 'org.example.maps', uuid: '9F8E-7D6C', sdKB: -1, intKB: 512, sdEmpty: true, state: 'nosd', procs: 0, redirected: 0 },
+    ],
+    jobs: mockJob ? [mockJob.pkg] : [],
+    sdData: ['com.example.game', 'com.example.music'],
+  }) };
+  if (cmd.includes(' check com.example.music')) return { errno: 1, stderr: '', stdout:
+    '! names with characters exFAT forbids: " * : < > ? | \\ or control characters (1):\n    saves/slot:1.dat' };
+  if (cmd.includes(' check ')) return { errno: 0, stderr: '', stdout: 'OK: all names and file types can be stored on exfat' };
+  // migrate --bg runs ~10 s of simulated phases; progress/cancel follow it
+  const m = cmd.match(/ (migrate|migrate-back|migrate-obb|progress|cancel) ([\w.]+)/);
+  if (m && m[1].startsWith('migrate')) {
+    mockJob = { pkg: m[2], t0: Date.now(), cancelled: 0, back: m[1] === 'migrate-back', obb: m[1] === 'migrate-obb' };
+    return { errno: 0, stderr: '', stdout: `migration of ${m[2]} started` };
+  }
+  if (m && m[1] === 'cancel') {
+    if (mockJob?.pkg === m[2]) mockJob.cancelled = Date.now();
+    return { errno: 0, stderr: '', stdout: 'cancelling' };
+  }
+  if (m && m[1] === 'progress') {
+    const j = mockJob?.pkg === m[2] ? mockJob : null;
+    if (!j) return { errno: 0, stderr: '', stdout: 'none - start 0 0' };
+    const t = (Date.now() - j.t0) / 1000, total = 2048000;
+    const log = '== checking names and file types\nOK: all names and file types can be stored on exfat\n== copying 2048000 KB: Android/data Android/obb -> SD 1A2B-3C4D';
+    const verified = 'data: verified 40 files, 1048576000 bytes\nobb: verified 2 files, 1048576000 bytes';
+    if (cmd.includes('--clear')) mockJob = null;
+    if (j.cancelled) {
+      return { errno: 0, stderr: '', stdout: Date.now() - j.cancelled < 2000 ? 'running - cleanup 0 0'
+        : `done 4 cleanup 0 0\n${log}\n${j.pkg}: migration cancelled. Partial SD copy removed, redirect undone.` };
+    }
+    const dir = j.back ? 'back' : j.obb ? 'obb' : 'to-sd';
+    if (j.obb && t >= 10) mockObbDone = true;
+    const line = t < 1 ? `running - ${j.back ? 'space' : 'check'} 0 0 ${dir}`
+      : t < 8 ? `running - copy ${Math.round((t - 1) / 7 * total)} ${total} ${dir}`
+      : t < 9 ? `running - verify 0 0 ${dir}` : t < 10 ? `running - ${j.obb ? 'commit' : 'delete'} 0 0 ${dir}`
+      : j.obb ? `done 0 delete 0 0 to-sd\n== copying 1048576 KB: Android/obb -> SD 1A2B-3C4D\n== verifying\nobb: verified 1 files, 1073741824 bytes\n== moving the new files into place\nremoved outdated main.41.${j.pkg}.obb\ninternal copy deleted\n${j.pkg}: moved 1048576 KB of new OBB files to SD 1A2B-3C4D`
+      : j.back ? `done 0 delete 0 0 to-sd\n== copying 2048000 KB: SD 1A2B-3C4D -> Android/data Android/obb\n== verifying\n${verified}\nSD copy deleted\n${j.pkg}: moved 2048000 KB back to internal storage, redirect stopped`
+      : `done 0 delete 0 0 to-sd\n${log}\n== verifying\n${verified}\ninternal copy deleted`;
+    return { errno: 0, stderr: '', stdout: line };
+  }
+  if (cmd.startsWith('pm list packages')) return { errno: 0, stderr: '', stdout:
+    ['com.example.game', 'com.example.music', 'org.example.maps', 'com.android.settings']
+      .filter(p => !(cmd.includes('-3') && p === 'com.android.settings')).map(p => `package:${p}`).join('\n') };
+  return { errno: 0, stdout: `(preview) ${cmd}`, stderr: '' };
+}
+
+(async () => {
+  try { packages = await loadPackages(); } catch (e) { console.error(e); }
+  await refreshStatus();
+})();
+</script>
+</body>
+</html>

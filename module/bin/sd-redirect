@@ -1,0 +1,1647 @@
+#!/system/bin/sh
+# sd-redirect - redirect Internal/Android/{data,obb}/<pkg> to <SD>/Android/{data,obb}/<pkg> with bind mounts.
+#
+# The SD card is exFAT/FAT, so its lower mount (/mnt/media_rw/<uuid>) is owned by media_rw and
+# apps cannot use it directly. Instead we bind the SD card's FUSE view of Android/data/<pkg>
+# (the same path the app gets from getExternalFilesDirs()[1]; getObbDirs()[1] for obb), where
+# MediaProvider already grants the owning app access.
+#
+# Note: mksh arithmetic is 32-bit, so byte/KB totals are computed in awk.
+#
+# Copyright (C) 2026 FadedAtlas. Licensed under GPL-3.0 (see LICENSE), with an additional attribution
+# term under section 7(b): see "Additional terms" in README.md.
+
+MODDIR=/data/adb/modules/sd-redirect
+DATA_DIR=/data/adb/sd-redirect
+CONF=$DATA_DIR/config
+LOG=$DATA_DIR/sd-redirect.log
+RUN=/dev/sd-redirect
+U=0     # Android user id
+POLL=2    # seconds between process sweeps
+WATCH=5   # seconds between supervisor checks
+HB_MAX=60 # a daemon whose heartbeat is older than this (seconds) is considered frozen
+MSG='SD Redirect: This app is migrated and requires SD card.'
+MSG_STARTED='SD Redirect: {app} runs from SD card'  # {app}: the app's label, filled in by SdRedirectToast
+KINDS='data obb'  # every configured app has both Android/data/<pkg> and Android/obb/<pkg> redirected
+
+SELF=$(readlink -f "$0")
+
+for b in /data/adb/ap/bin/busybox /data/adb/ksu/bin/busybox /data/adb/magisk/busybox; do
+  [ -x "$b" ] && { BB=$b; break; }
+done
+if [ -n "$BB" ]; then NSENTER="$BB nsenter"; SETSID="$BB setsid"; FLOCK="$BB flock"
+else NSENTER=/system/bin/nsenter; SETSID=/system/bin/setsid; FLOCK=/system/bin/flock; fi
+
+if [ "$(id -u)" != 0 ]; then echo "SD Redirect: must run as root" >&2; exit 1; fi
+
+# Always operate from init's mount namespace, whatever su namespace mode the root manager uses.
+if [ -z "$SD_REDIRECT_IN_INIT_NS" ] && [ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]; then
+  export SD_REDIRECT_IN_INIT_NS=1
+  exec $NSENTER -t 1 -m -- /system/bin/sh "$SELF" "$@"
+fi
+export SD_REDIRECT_IN_INIT_NS=1
+
+mkdir -p "$DATA_DIR" "$RUN"
+
+log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
+say() { echo "$*"; log "$*"; }
+dev() { /system/bin/stat -c %d "$1" 2>/dev/null; }
+nsx() { local p=$1; shift; $NSENTER -t "$p" -m -- "$@"; }  # run a command in <pid>'s mount namespace
+sd_mounted() { grep -q " /mnt/media_rw/$1 " /proc/mounts; }
+# sd_mark <uuid> <pkg>: record on the card that its Android/{data,obb}/<pkg> hold data this module put or kept
+# there. Markers live in Android/data/.sd-redirect/ (no package name starts with a dot), survive `reset`,
+# and only count while one of the app's SD folders is non-empty (json drops stale ones).
+sd_mark() {
+  local m=/mnt/media_rw/$1/Android/data/.sd-redirect
+  [ -f "$m/$2" ] || { mkdir -p "$m" && : > "$m/$2"; } 2>/dev/null
+}
+# int_dir <kind> <pkg> / sd_dir <uuid> <kind> <pkg>: the internal and SD (lower mount) folder of one kind
+int_dir() { echo "/data/media/$U/Android/$1/$2"; }
+sd_dir() { echo "/mnt/media_rw/$1/Android/$2/$3"; }
+kind_gid() { if [ "$1" = obb ]; then echo 1079; else echo 1078; fi; }  # ext_obb_rw / ext_data_rw
+# du_kinds <Android dir> <pkg>: total KB of <Android dir>/{data,obb}/<pkg> (-1 if neither exists)
+du_kinds() {
+  local k t=-1 s
+  for k in $KINDS; do
+    [ -d "$1/$k/$2" ] || continue
+    s=$(du -sk "$1/$k/$2" 2>/dev/null | awk '{ print $1 }')
+    t=$(awk -v a="$t" -v b="${s:-0}" 'BEGIN { printf "%.0f", (a < 0 ? 0 : a) + b }')
+  done
+  echo "$t"
+}
+# has_kinds <Android dir> <pkg>: <Android dir>/data/<pkg> or <Android dir>/obb/<pkg> is non-empty
+has_kinds() {
+  local k
+  for k in $KINDS; do [ -n "$(ls -A "$1/$k/$2" 2>/dev/null)" ] && return 0; done
+  return 1
+}
+# pkg_pids <pkg>: PIDs of all processes of a package (pkg and pkg:subprocess)
+pkg_pids() { /system/bin/ps -A -o PID,NAME | awk -v p="$1" '$2 == p || index($2, p ":") == 1 { print $1 }'; }
+
+# ---------------------------------------------------------------- config
+
+load_conf() {
+  local a b _
+  MODE=ns; ENTRIES=; PKGS=
+  [ -f "$CONF" ] || return 0
+  while read -r a b _; do
+    case $a in
+      ''|'#'*) continue ;;
+      MODE=*) MODE=${a#MODE=}; continue ;;
+    esac
+    ENTRIES="$ENTRIES$a ${b:--}
+"
+    PKGS="$PKGS $a"
+  done <<EOF
+$(tr -d '\r' < "$CONF")
+EOF
+}
+
+# sd_uuid -: print the first mounted SD volume (only used to pin new or legacy entries)
+sd_uuid() {
+  awk '$2 ~ "^/mnt/media_rw/" { sub("^/mnt/media_rw/", "", $2); print $2; exit }' /proc/mounts
+}
+
+# entry_uuid <pkg>: print the pinned uuid ("-" if unpinned); fails if the package is not configured
+entry_uuid() {
+  local p u
+  while read -r p u; do
+    [ -n "$p" ] && [ "$p" = "$1" ] && { echo "$u"; return 0; }
+  done <<EOF
+$ENTRIES
+EOF
+  return 1
+}
+
+# lookup <process name>: set PKG and UUID if the process belongs to a configured, pinned package
+lookup() {
+  local base=${1%%:*}
+  [ -n "$base" ] || return 1
+  UUID=$(entry_uuid "$base") || return 1
+  PKG=$base
+  [ "$UUID" != - ]
+}
+
+config_remove() {  # config_remove <pkg>; plain field match, no regex (toybox sed's BRE has no \|)
+  awk -v p="$1" '{ k = $1; sub(/\r$/, "", k) } k != p' "$CONF" > "$CONF.tmp" \
+    && cat "$CONF.tmp" > "$CONF"
+  rm -f "$CONF.tmp"
+}
+
+# pin_legacy: entries written without a uuid get pinned to the card mounted right now
+pin_legacy() {
+  local p u uuid re
+  uuid=$(sd_uuid)
+  [ -n "$uuid" ] || return 0
+  while read -r p u; do
+    [ -n "$p" ] && [ "$u" = - ] || continue
+    re=$(echo "$p" | sed 's/\./\\./g')
+    sed -i "s/^[[:space:]]*$re[[:space:]]*\$/$p $uuid/" "$CONF"
+    say "$p: pinned to SD $uuid"
+  done <<EOF
+$ENTRIES
+EOF
+  load_conf
+}
+
+# ---------------------------------------------------------------- directories
+
+# prepare <pkg> <uuid>: make sure both ends of the bind mounts exist (data and obb)
+prepare() {
+  local pkg=$1 uuid=$2 k sd int uid ctx
+  [ -d "/data/user/$U/$pkg" ] || { say "$pkg: not installed for user $U"; return 1; }
+  sd_mounted "$uuid" || { say "$pkg: SD volume $uuid is not mounted"; return 1; }
+
+  for k in $KINDS; do
+    sd=$(sd_dir "$uuid" "$k" "$pkg")
+    [ -d "$sd" ] || mkdir -p "$sd" || { say "$pkg: cannot create $sd"; return 1; }
+
+    # Normally created by the system on first use; recreate it with the usual owner/label if missing.
+    int=$(int_dir "$k" "$pkg")
+    if [ ! -d "$int" ]; then
+      uid=$(/system/bin/stat -c %u "/data/user/$U/$pkg")
+      ctx=$(/system/bin/stat -c %C "/data/user/$U/$pkg")
+      if mkdir -p "$int" && chown "$uid:$(kind_gid "$k")" "$int" && chmod 2770 "$int" \
+         && chcon "u:object_r:media_rw_data_file:s0${ctx#*:s0}" "$int"; then
+        log "$pkg: created $int"
+      else
+        say "$pkg: failed to create $int"; return 1
+      fi
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- global mode
+
+# global_targets <kind> <pkg>: the views of the internal folder to bind over. Installers (Play Store OBB downloads)
+# and apps with Android/ write access see storage through their own views; usually the /mnt/user bind already
+# propagates there, and global_on skips targets that are redirected.
+global_targets() {
+  echo "/mnt/user/$U/emulated/$U/Android/$1/$2"
+  echo "/mnt/pass_through/$U/emulated/$U/Android/$1/$2"
+  echo "/mnt/androidwritable/$U/emulated/$U/Android/$1/$2"
+  [ "$1" = obb ] && echo "/mnt/installer/$U/emulated/$U/Android/obb/$2"
+  return 0
+}
+
+global_redirected() {  # global_redirected <pkg> <uuid>: both data and obb
+  local k sdev
+  for k in $KINDS; do
+    sdev=$(dev "/mnt/user/$U/$2/Android/$k/$1")
+    [ -n "$sdev" ] && [ "$sdev" = "$(dev "/mnt/user/$U/emulated/$U/Android/$k/$1")" ] || return 1
+  done
+}
+
+# global_on <pkg> <uuid>: bind in init's namespace; propagates to app namespaces created later
+global_on() {
+  local pkg=$1 uuid=$2 k src sdev t i=0 rc=0
+  for k in $KINDS; do
+    src=/mnt/user/$U/$uuid/Android/$k/$pkg
+    while [ ! -d "$src" ] && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done
+    sdev=$(dev "$src")
+    [ -n "$sdev" ] || { say "$pkg: $src not found (SD FUSE view not ready?)"; rc=1; continue; }
+    for t in $(global_targets "$k" "$pkg"); do
+      [ -d "$t" ] || continue
+      [ "$(dev "$t")" = "$sdev" ] && continue  # already redirected, directly or by propagation
+      if /system/bin/mount -o bind "$src" "$t"; then say "$pkg: bound $src -> $t"
+      else say "$pkg: bind $src -> $t FAILED"; fi
+    done
+  done
+  return $rc
+}
+
+global_off() {  # global_off <pkg> <uuid>
+  local pkg=$1 k sdev t n
+  for k in $KINDS; do
+    sdev=$(dev "/mnt/user/$U/$2/Android/$k/$pkg")
+    [ -n "$sdev" ] || continue
+    for t in $(global_targets "$k" "$pkg") "$(int_dir "$k" "$pkg")"; do
+      n=0
+      while [ "$(dev "$t")" = "$sdev" ] && [ $n -lt 5 ]; do
+        /system/bin/umount -l "$t" 2>/dev/null && log "$pkg: unmounted $t"
+        n=$((n + 1))
+      done
+    done
+  done
+}
+
+# global_check: (re)apply global mounts whose card showed up after boot; retried at most once a minute
+global_check() {
+  local p u now t
+  now=$(date +%s)
+  while read -r p u; do
+    [ -n "$p" ] && [ "$u" != - ] && sd_mounted "$u" || continue
+    migrating_active "$p" && continue
+    global_redirected "$p" "$u" && continue
+    t=$(cat "$RUN/gretry.$p" 2>/dev/null || echo 0)
+    [ $((now - t)) -ge 60 ] || continue
+    echo "$now" > "$RUN/gretry.$p"
+    log "$p: SD $u present but not redirected, applying"
+    prepare "$p" "$u" >/dev/null && global_on "$p" "$u" >/dev/null
+  done <<EOF
+$ENTRIES
+EOF
+}
+
+# ---------------------------------------------------------------- safeguards
+
+# migrating_active <pkg>: a migration holds the flag and its process is still alive
+migrating_active() {
+  local f=$RUN/migrating.$1 p
+  [ -f "$f" ] || return 1
+  p=$(cat "$f" 2>/dev/null)
+  [ -n "$p" ] && [ -d "/proc/$p" ] && return 0
+  rm -f "$f"  # stale: the migrating shell was killed
+  return 1
+}
+
+# toast <text> [pkg]: show a toast with the app_process helper; with <pkg>, "{app}" becomes its label.
+# On failure the helper's exception (or the reason) goes to the log.
+toast() {
+  local err rc
+  [ -f "$MODDIR/bin/sd-redirect-toast.dex" ] || { log "toast: $MODDIR/bin/sd-redirect-toast.dex missing"; return 1; }
+  err=$(CLASSPATH="$MODDIR/bin/sd-redirect-toast.dex" timeout 10 /system/bin/app_process /system/bin SdRedirectToast "$@" 2>&1 >/dev/null)
+  rc=$?
+  [ $rc = 0 ] && return 0
+  log "toast: helper exited $rc: $(echo "$err" | grep -E 'Exception|Error|Caused by' | head -n 3 | tr '\n' ' ')"
+  return 1
+}
+
+# notify_started <pkg>: toast that a redirected app has started; max once per 15s per app.
+# Toast only: a notification on every launch would be noise.
+notify_started() {
+  local f=$RUN/started.$1 now last
+  now=$(date +%s)
+  last=$(cat "$f" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt 15 ] && return 0
+  echo "$now" > "$f"
+  ( if toast "$MSG_STARTED" "$1"; then log "$1: start toast shown"; else log "$1: start toast failed"; fi ) &
+}
+
+# notify_missing <pkg>: toast (app_process helper), falling back to a notification; max once per 15s
+notify_missing() {
+  local pkg=$1 f=$RUN/notified.$1 now last
+  now=$(date +%s)
+  last=$(cat "$f" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt 15 ] && return 0
+  echo "$now" > "$f"
+  (
+    if toast "$MSG"; then
+      log "$pkg: toast shown"
+    elif cmd notification post -S bigtext -t 'SD Redirect' "sd-redirect_$pkg" "$MSG" >/dev/null 2>&1; then
+      log "$pkg: notification posted"
+    else
+      log "$pkg: could not notify the user"
+    fi
+  ) &
+}
+
+# notify_obb <pkg> <KB>: tell the user that new OBB files are hidden on internal storage (notification, else toast)
+notify_obb() {
+  local mb msg
+  mb=$(awk -v k="$2" 'BEGIN { printf "%.0f", k / 1024 }')
+  msg="SD Redirect: New OBB files of $1 ($mb MB) were saved to internal storage, where the redirect hides them. Open SD Redirect and tap Move new OBB to SD."
+  (
+    if cmd notification post -S bigtext -t 'SD Redirect' "sd-redirect_obb_$1" "$msg" >/dev/null 2>&1; then
+      log "$1: new OBB notification posted"
+    elif toast "SD Redirect: New OBB files of {app} are on internal storage. Open SD Redirect to move them." "$1"; then
+      log "$1: new OBB toast shown"
+    else
+      log "$1: could not notify about new OBB files"
+    fi
+  ) &
+}
+
+# obb_watch: notice OBB files that another app (the Play Store, a file manager) put into a redirected app's
+# internal obb folder, where the redirect hides them from the app. In global mode that folder is usually covered
+# by the redirect itself (and installers write to the card), so only uncovered folders are looked at. Notifies once
+# per set of files, after it has stopped changing for 60 s (a download in progress keeps changing it).
+obb_watch() {
+  local p u d f sig s t now
+  now=$(date +%s)
+  while read -r p u; do
+    [ -n "$p" ] && [ "$u" != - ] || continue
+    d=$(int_dir obb "$p"); f=$RUN/obbseen.$p
+    if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then rm -f "$f" "$RUN/obbnote.$p"; continue; fi
+    sd_mounted "$u" && ! migrating_active "$p" && [ "$(dev "$d")" = "$(dev "/data/media/$U")" ] || continue
+    sig=$( (cd "$d" && find . -type f -exec /system/bin/stat -c '%s %n' {} +) | LC_ALL=C sort | cksum | awk '{ print $1 "-" $2 }')
+    s=; t=
+    read -r s t 2>/dev/null < "$f"
+    if [ "$s" != "$sig" ]; then echo "$sig $now" > "$f"; continue; fi
+    [ $((now - t)) -ge 60 ] || continue
+    [ "$(cat "$RUN/obbnote.$p" 2>/dev/null)" = "$sig" ] && continue
+    echo "$sig" > "$RUN/obbnote.$p"
+    log "$p: new OBB files on internal storage, hidden by the redirect"
+    notify_obb "$p" "$(du -sk "$d" | awk '{ print $1 }')"
+  done <<EOF
+$ENTRIES
+EOF
+}
+
+# ---------------------------------------------------------------- per-process gatekeeper
+
+proc_uid() { awk '/^Uid:/ { print $2; exit }' "/proc/$1/status" 2>/dev/null; }
+
+# handle <pid> <pkg> <uuid> <name> [start type]: block the process (migration running / SD card missing)
+# or, in ns mode, bind the SD dir inside its mount namespace. <name> is the process name; [start type] is the
+# am_proc_start hosting type (activity, top-activity, service, broadcast, content provider, ...; empty from sweep).
+# Toasts are only for a launch the user sees: the main process (name = pkg, not pkg:service) started for an
+# activity. Android also starts apps in the background (push messages, jobs, receivers), which must stay silent.
+handle() {
+  local pid=$1 pkg=$2 uuid=$3 name=$4 fg= i=0 u k src dst sdev ddev res=done
+  [ "$name" = "$pkg" ] && case $5 in *activity*) fg=1 ;; esac
+  mkdir "$RUN/lock.$pid" 2>/dev/null || return 0
+  if [ -f "$RUN/done.$pid" ] || [ -f "$RUN/fail.$pid" ]; then rmdir "$RUN/lock.$pid"; return 0; fi
+
+  if migrating_active "$pkg"; then
+    # no done marker: the next process of this app is checked again
+    kill -9 "$pid" 2>/dev/null && log "$pkg[$pid]: killed, migration in progress"
+    rmdir "$RUN/lock.$pid"; return 0
+  fi
+  if ! sd_mounted "$uuid"; then
+    kill -9 "$pid" 2>/dev/null && log "$pkg[$pid]: killed, SD card $uuid is missing (start: ${5:-unknown})"
+    [ -n "$fg" ] && notify_missing "$pkg"
+    touch "$RUN/done.$pid"; rmdir "$RUN/lock.$pid"; return 0
+  fi
+  if [ "$MODE" = global ]; then
+    [ -n "$fg" ] && notify_started "$pkg"
+    touch "$RUN/done.$pid"; rmdir "$RUN/lock.$pid"; return 0
+  fi
+
+  # Zygote sets up /storage and drops to the app uid only after that; wait for the uid change
+  # so we never touch zygote's namespace or get covered by its app-data-isolation mounts.
+  while :; do
+    [ -d "/proc/$pid" ] || { rmdir "$RUN/lock.$pid"; return 1; }
+    u=$(proc_uid "$pid")
+    [ -n "$u" ] && [ "$u" != 0 ] && break
+    i=$((i + 1))
+    if [ $i -ge 200 ]; then log "$pkg[$pid]: still uid 0 after 10s, skipped"; touch "$RUN/fail.$pid"; rmdir "$RUN/lock.$pid"; return 1; fi
+    sleep 0.05
+  done
+  if [ "$(readlink "/proc/$pid/ns/mnt")" = "$(readlink /proc/1/ns/mnt)" ]; then
+    log "$pkg[$pid]: shares init's namespace, skipped"; touch "$RUN/fail.$pid"; rmdir "$RUN/lock.$pid"; return 1
+  fi
+
+  for k in $KINDS; do
+    src=/storage/$uuid/Android/$k/$pkg
+    dst=/storage/emulated/$U/Android/$k/$pkg
+    sdev=$(nsx "$pid" /system/bin/stat -c %d "$src" 2>/dev/null)
+    ddev=$(nsx "$pid" /system/bin/stat -c %d "$dst" 2>/dev/null)
+    if [ -z "$sdev" ] || [ -z "$ddev" ]; then
+      log "$pkg[$pid]: $src or $dst missing in app namespace"; res=fail
+    elif [ "$sdev" = "$ddev" ]; then
+      :
+    elif nsx "$pid" /system/bin/mount -o bind "$src" "$dst" 2>>"$LOG"; then
+      log "$pkg[$pid]: $k redirected"
+    else
+      log "$pkg[$pid]: $k bind mount FAILED"; res=fail
+    fi
+  done
+  touch "$RUN/$res.$pid"
+  [ $res = done ] && [ -n "$fg" ] && notify_started "$pkg"
+  rmdir "$RUN/lock.$pid"
+}
+
+# sweep: catch processes the event watcher missed
+sweep() {
+  local pid name f
+  /system/bin/ps -A -o PID,NAME | while read -r pid name; do
+    [ -n "$name" ] || continue
+    case " $PKGS " in *" ${name%%:*} "*) ;; *) continue ;; esac
+    [ -f "$RUN/done.$pid" ] || [ -f "$RUN/fail.$pid" ] && continue
+    lookup "$name" && handle "$pid" "$PKG" "$UUID" "$name"
+  done
+  for f in "$RUN"/done.* "$RUN"/fail.* "$RUN"/lock.*; do
+    [ -e "$f" ] && [ ! -d "/proc/${f##*.}" ] && rm -rf "$f"
+  done
+}
+
+daemon() {
+  local line pid name type up n=0 _
+  # The kernel holds this lock until the daemon and all its children are gone, so a second daemon
+  # can never run next to one that survived a kill (e.g. stuck in uninterruptible sleep).
+  exec 8>"$RUN/daemon.lock"
+  lock_fd 8 || { log "daemon: another daemon still holds the lock, exiting"; exit 1; }
+  rm -rf "$RUN"/done.* "$RUN"/fail.* "$RUN"/lock.*
+  echo $$ > "$RUN/daemon.pid"
+  load_conf
+  [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ] && mv -f "$LOG" "$LOG.old"
+  log "daemon started (pid $$, mode $MODE, packages:${PKGS:- none})"
+
+  # Fast path: am_proc_start fires right after zygote forks the app process.
+  # Event payload: [user,pid,uid,process,type,component]
+  /system/bin/logcat -b events -v raw -T 1 -s am_proc_start 2>/dev/null | while IFS= read -r line; do
+    line=${line#[}; line=${line%]}
+    IFS=, read -r _ pid _ name type _ <<EOF
+$line
+EOF
+    lookup "$name" && handle "$pid" "$PKG" "$UUID" "$name" "$type" &
+  done &
+
+  while :; do
+    # heartbeat for the supervisor: monotonic seconds since boot, immune to clock changes
+    read -r up _ < /proc/uptime; echo "${up%.*}" > "$RUN/heartbeat"
+    sweep
+    [ "$MODE" = global ] && global_check
+    n=$((n + 1)); [ $((n % 15)) = 0 ] && obb_watch  # every ~30 s
+    sleep "$POLL"
+  done
+}
+
+# lock_fd <fd>: take a non-blocking exclusive lock on an open fd; fails only if someone else holds it.
+# mksh doesn't pass fds opened by `exec n>` to external commands, so hand flock a dup as fd 3. The lock
+# belongs to the shared open file, so it stays held through our fd after flock exits.
+lock_fd() {
+  $FLOCK -n 3 3>&"$1" 2>/dev/null
+  case $? in 0) return 0 ;; 1) return 1 ;; *) return 0 ;; esac  # no flock binary: rely on the pid checks
+}
+
+# role_pid <daemon|supervise>: the PID from $RUN/<role>.pid if that process is still ours
+role_pid() {
+  local p
+  p=$(cat "$RUN/$1.pid" 2>/dev/null)
+  [ -n "$p" ] && { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | grep -q "sd-redirect $1" && echo "$p"
+}
+daemon_pid() { role_pid daemon; }
+
+# kill_role <daemon|supervise>: kill every process group of that role, including orphans and frozen ones.
+# Both roles run as session leaders (setsid), so the PID is also the process group ID.
+kill_role() {
+  local p
+  for p in $(role_pid "$1") $(/system/bin/pgrep -f "sd-redirect $1" 2>/dev/null); do
+    kill -KILL -"$p" "$p" 2>/dev/null
+  done
+  rm -f "$RUN/$1.pid"
+}
+
+# hb_age: seconds since the daemon's last heartbeat
+hb_age() {
+  local now hb _
+  read -r now _ < /proc/uptime
+  hb=$(cat "$RUN/heartbeat" 2>/dev/null)
+  echo $(( ${now%.*} - ${hb:-0} ))
+}
+
+# supervise: keep exactly one daemon running. Restart it when it exits or its heartbeat stops (frozen).
+supervise() {
+  local d t0 now _ delay=5
+  exec 9>"$RUN/supervise.lock"
+  lock_fd 9 || { log "supervisor already running, exiting"; exit 0; }
+  echo $$ > "$RUN/supervise.pid"
+  while :; do
+    kill_role daemon
+    read -r t0 _ < /proc/uptime; t0=${t0%.*}
+    echo "$t0" > "$RUN/heartbeat"
+    $SETSID /system/bin/sh "$SELF" daemon 9>&- </dev/null >/dev/null 2>&1 &
+    sleep "$WATCH"
+    while d=$(daemon_pid); do
+      if [ "$(hb_age)" -gt "$HB_MAX" ]; then
+        log "daemon $d frozen (no heartbeat for $(hb_age)s), killing it"
+        break
+      fi
+      sleep "$WATCH"
+    done
+    [ -n "$d" ] || log "daemon exited unexpectedly"
+    kill_role daemon
+    # back off if it keeps dying right after start
+    read -r now _ < /proc/uptime
+    if [ $(( ${now%.*} - t0 )) -lt 60 ]; then delay=$((delay * 2)); [ $delay -gt 300 ] && delay=300; else delay=5; fi
+    log "restarting daemon in ${delay}s"
+    sleep "$delay"
+  done
+}
+
+stop_daemon() {
+  [ -n "$(role_pid supervise)$(daemon_pid)" ] && log "daemon stopped"
+  kill_role supervise  # first, so it can't restart the daemon
+  kill_role daemon
+}
+
+start_daemon() {
+  stop_daemon
+  $SETSID /system/bin/sh "$SELF" supervise </dev/null >/dev/null 2>&1 &
+}
+
+# ---------------------------------------------------------------- migration helpers
+
+# check_report <title>: print up to 20 offending paths read from stdin; fails if there were any
+check_report() {
+  local list n
+  list=$(cat)
+  [ -n "$list" ] || return 0
+  n=$(printf '%s\n' "$list" | wc -l)
+  echo "! $1 ($n):"
+  printf '%s\n' "$list" | head -n 20 | sed 's/^/    /'
+  [ "$n" -gt 20 ] && echo "    ... and $((n - 20)) more"
+  return 1
+}
+
+# tree_list <dir>: sorted "d <path>" / "f <size> <path>" lines describing a tree
+tree_list() {
+  ( cd "$1" && {
+      find . -mindepth 1 -type d | sed 's/^/d /'
+      find . -type f -exec /system/bin/stat -c 'f %s %n' {} +
+    } ) | LC_ALL=C sort
+}
+
+# verify_copy <src> <dst> [src name] [dst name]: both trees must have the same dirs, files and file sizes
+verify_copy() {
+  local a=$RUN/verify.$$.src b=$RUN/verify.$$.dst  # per migrating shell: migrations of other apps may run at once
+  tree_list "$1" > "$a"
+  tree_list "$2" > "$b"
+  if cmp -s "$a" "$b"; then
+    awk '$1 == "f" { n++; s += $2 } END { printf "verified %d files, %.0f bytes\n", n, s }' "$a"
+    rm -f "$a" "$b"; return 0
+  fi
+  echo "verification FAILED (- ${3:-internal} only, + ${4:-SD} only):"
+  diff -u "$a" "$b" | grep '^[-+][fd] ' | head -n 20 | sed 's/^/    /'
+  rm -f "$a" "$b"; return 1
+}
+
+migrate_guard() {  # migrate_guard <pkg>: keep the app dead while its data is being moved
+  local pid
+  while :; do
+    for pid in $(pkg_pids "$1"); do
+      kill -9 "$pid" 2>/dev/null && log "$1[$pid]: killed, migration in progress"
+    done
+    sleep 1
+  done
+}
+
+# Migration state for the WebUI and `cancel`, in $RUN (MIG_PKG / GUARD are set by cmd_migrate):
+#   migrating.<pkg>  PID of the migrating shell        mguard.<pkg>  PID of migrate_guard
+#   mcancel.<pkg>    cancel requested                  mjob.<pkg>.phase  "<phase> [totalKB baseAvailKB dfDir]"
+#   mjob.<pkg>.{pid,out,rc}  detached job started by `migrate --bg`   mjob.<pkg>.cp  PID of the running cp
+# $DATA_DIR/migration.<pkg> ("<phase> <uuid> [back|obb]") survives a reboot, so `start` can roll back a cut-off
+# migration. MIG_DIR=back marks a migrate-back (SD -> internal), MIG_DIR=obb a migrate-obb.
+# mjob.<pkg>.cp: "<cp pid> <KB already copied by earlier cp runs of the same job>".
+mphase() {
+  echo "$*" > "$RUN/mjob.$MIG_PKG.phase"
+  echo "$1 $MIG_UUID $MIG_DIR" > "$DATA_DIR/migration.$MIG_PKG"
+}
+cancelled() { [ -f "$RUN/mcancel.$MIG_PKG" ]; }
+
+migrate_unlock() {  # stop the guard and drop the migration lock; safe to call twice
+  [ -n "$GUARD" ] && kill "$GUARD" 2>/dev/null
+  GUARD=
+  [ -n "$MIG_PKG" ] && rm -f "$RUN/migrating.$MIG_PKG" "$RUN/mguard.$MIG_PKG" "$RUN/mcancel.$MIG_PKG" \
+    "$DATA_DIR/migration.$MIG_PKG"
+}
+
+# empty_kinds <Android dir> <pkg>: delete the contents of <Android dir>/{data,obb}/<pkg>; fails if a delete did
+# (toybox find prints every path it deletes, hence >/dev/null)
+empty_kinds() {
+  local k rc=0
+  for k in $KINDS; do
+    [ -d "$1/$k/$2" ] || continue
+    find "$1/$k/$2" -mindepth 1 -delete >/dev/null 2>&1 || rc=1
+  done
+  return $rc
+}
+
+# recover_migrations: undo migrations cut off by a reboot or kill -9 (their marker is still there).
+# The source is only touched in the last phase, after verification, so it is always intact before that.
+recover_migrations() {
+  local f pkg ph uuid dir sdo _
+  for f in "$DATA_DIR"/migration.*; do
+    [ -f "$f" ] || continue
+    pkg=${f#"$DATA_DIR"/migration.}
+    migrating_active "$pkg" && continue
+    read -r ph uuid dir _ < "$f"
+    if [ "$dir" = obb ]; then
+      # migrate-obb: before `commit` only the staging folder on the card changed; from `commit` on the staged
+      # files are verified, so finishing the move is safe. The redirect is kept either way.
+      sdo=/mnt/media_rw/$uuid/Android/obb
+      if [ -z "$uuid" ] || ! sd_mounted "$uuid"; then
+        say "$pkg: moving new OBB files was interrupted ($ph) and SD card $uuid is missing; the internal copy is kept, move it again later"
+      else
+        case $ph in
+          commit|delete)
+            if obb_commit "$sdo" "$sdo/.sd-redirect/$pkg" "$pkg" >/dev/null; then
+              sync
+              find "$(int_dir obb "$pkg")" -mindepth 1 -delete >/dev/null 2>&1
+              say "$pkg: moving new OBB files was interrupted after verification ($ph); finished it"
+            else
+              say "$pkg: moving new OBB files was interrupted ($ph) and could not be finished; the internal copy is kept, move it again"
+            fi ;;
+          *)
+            rm -rf "$sdo/.sd-redirect/$pkg"
+            say "$pkg: moving new OBB files was interrupted ($ph). Partial copy removed, nothing else changed." ;;
+        esac
+      fi
+      rm -f "$f"
+      continue
+    fi
+    if [ "$dir" = back ]; then
+      case $ph in
+        clear|copy|verify|cleanup)
+          empty_kinds "/data/media/$U/Android" "$pkg"
+          say "$pkg: moving back to internal storage was interrupted ($ph). Partial internal copy removed, the app still uses the SD card." ;;
+        delete)
+          config_remove "$pkg"
+          rm -f "/mnt/media_rw/$uuid/Android/data/.sd-redirect/$pkg" 2>/dev/null
+          if [ -n "$uuid" ] && sd_mounted "$uuid"; then
+            empty_kinds "/mnt/media_rw/$uuid/Android" "$pkg"
+            say "$pkg: interrupted while deleting the SD copy; the internal copy was already verified. Redirect stopped, SD copy deleted."
+          else
+            say "$pkg: interrupted while deleting the SD copy; the internal copy was already verified. Redirect stopped; SD card $uuid is missing, its leftovers are still there."
+          fi ;;
+        *) log "$pkg: moving back was interrupted before anything was changed ($ph)" ;;
+      esac
+      rm -f "$f"
+      continue
+    fi
+    case $ph in
+      clear|copy|verify|cleanup)
+        config_remove "$pkg"
+        if [ -n "$uuid" ] && sd_mounted "$uuid"; then
+          empty_kinds "/mnt/media_rw/$uuid/Android" "$pkg"
+          say "$pkg: migration was interrupted ($ph). Partial SD copy removed, redirect undone: the app uses internal storage again."
+        else
+          say "$pkg: migration was interrupted ($ph). Redirect undone; SD card $uuid is missing, its partial copy is still there."
+        fi ;;
+      delete) say "$pkg: interrupted while deleting the internal copy; the SD copy was already verified, redirect kept" ;;
+      *) log "$pkg: migration was interrupted before anything was changed ($ph)" ;;
+    esac
+    rm -f "$f"
+  done
+  load_conf
+}
+
+# kill_desc <pid> <except>: SIGKILL every descendant of <pid>, except the subtree of <except>
+kill_desc() {
+  kill -9 $(/system/bin/ps -A -o PID,PPID | awk -v r="$1" -v x="$2" '
+    NR > 1 { par[$1] = $2 }
+    END { for (p in par) { q = p; while ((q in par) && q != r && q != x) q = par[q]; if (q == r && p != r) print p } }') 2>/dev/null
+}
+
+job_alive() {  # job_alive <pkg>: the detached `migrate --bg` job of <pkg> is still running
+  local p
+  p=$(cat "$RUN/mjob.$1.pid" 2>/dev/null)
+  [ -n "$p" ] && { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | grep -q "sd-redirect migrate-job $1 "
+}
+
+# migrate_claim <pkg>: make sure no migration of <pkg> is running and hold flock on $RUN/mlock.<pkg> (fd 7) until
+# migrate_claimed. The caller records its claim in between (migrating.<pkg>, or mjob.<pkg>.pid for --bg), so two
+# starts at the same moment can't both pass the check. The lock is released by itself if the process dies.
+migrate_claim() {
+  exec 7>"$RUN/mlock.$1"
+  $FLOCK -w 10 3 3>&7 2>/dev/null
+  [ $? = 1 ] && { exec 7>&-; echo "a migration of $1 is already starting"; return 1; }  # >1: no flock binary
+  if migrating_active "$1" || { [ -z "$MIG_JOB" ] && job_alive "$1"; }; then
+    exec 7>&-; echo "a migration of $1 is already running"; return 1
+  fi
+}
+migrate_claimed() { exec 7>&-; }
+
+migrate_job() {  # migrate-job <pkg> [options]: worker of `migrate --bg`; exit code goes to mjob.<pkg>.rc
+  local rc
+  MIG_JOB=1  # mjob.<pkg>.pid is our own PID: cmd_migrate must not count this job as another migration
+  case " $* " in
+    *" --back "*) cmd_migrate_back "$@"; rc=$? ;;
+    *" --obb "*) cmd_migrate_obb "$@"; rc=$? ;;
+    *) cmd_migrate "$@"; rc=$? ;;
+  esac
+  migrate_unlock
+  echo "$rc" > "$RUN/mjob.$1.rc"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_start() {
+  local i=0 p u
+  load_conf
+  while [ -z "$(sd_uuid)" ] && [ $i -lt 90 ]; do sleep 2; i=$((i + 1)); done
+  [ -n "$(sd_uuid)" ] || log "no SD card mounted after 180s"
+  recover_migrations
+  pin_legacy
+  while read -r p u; do
+    [ -n "$p" ] && [ "$u" != - ] || continue
+    if ! sd_mounted "$u"; then say "$p: SD card $u missing, the app will be blocked"; continue; fi
+    prepare "$p" "$u" || continue
+    [ "$MODE" = global ] && global_on "$p" "$u"
+  done <<EOF
+$ENTRIES
+EOF
+  start_daemon
+  say "mode $MODE: daemon started"
+}
+
+cmd_add() {
+  local pkg=$1 uuid=$2
+  [ -n "$pkg" ] || { echo "usage: sd-redirect add <pkg> [uuid]"; return 1; }
+  load_conf
+  case " $PKGS " in *" $pkg "*) echo "$pkg is already configured"; return 0 ;; esac
+  [ -n "$uuid" ] || uuid=$(sd_uuid)
+  [ -n "$uuid" ] || { echo "no SD card mounted"; return 1; }
+  sd_mounted "$uuid" || { echo "SD card $uuid is not mounted"; return 1; }
+  [ -s "$CONF" ] && [ -n "$(tail -c 1 "$CONF")" ] && echo >> "$CONF"
+  echo "$pkg $uuid" >> "$CONF"
+  load_conf
+  prepare "$pkg" "$uuid" || return 1
+  am force-stop --user "$U" "$pkg"
+  [ "$MODE" = global ] && global_on "$pkg" "$uuid"
+  start_daemon
+  echo "$pkg added, pinned to SD $uuid. Existing internal data is now hidden; use 'sd-redirect migrate $pkg' to move it."
+}
+
+cmd_remove() {
+  local pkg=$1 uuid
+  [ -n "$pkg" ] || { echo "usage: sd-redirect remove <pkg>"; return 1; }
+  migrating_active "$pkg" && { echo "a migration of $pkg is running; cancel it first"; return 1; }
+  load_conf
+  uuid=$(entry_uuid "$pkg") || { echo "$pkg is not configured"; return 1; }
+  am force-stop --user "$U" "$pkg"
+  [ "$uuid" != - ] && global_off "$pkg" "$uuid"
+  config_remove "$pkg"
+  load_conf
+  entry_uuid "$pkg" >/dev/null && { say "$pkg: could not remove it from $CONF"; return 1; }
+  start_daemon
+  say "$pkg removed (data on the SD card was left in place)"
+}
+
+# find_kinds <pkg> "<kinds>" <find tests...>: run find under {data,obb}/<pkg> (cwd: internal Android dir),
+# printing paths as "data/<path>" / "obb/<path>"
+find_kinds() {
+  local pkg=$1 kinds=$2 k
+  shift 2
+  for k in $kinds; do
+    find "$k/$pkg" -mindepth 1 "$@" | awk -v p="/$pkg/" '{ i = index($0, p); print substr($0, 1, i) substr($0, i + length(p)) }'
+  done
+}
+
+# check <pkg> [kinds]: read-only scan of internal Android/{data,obb}/<pkg> (or only the given kinds) for entries
+# exFAT/FAT can't store
+cmd_check() {
+  local pkg=$1 uuid k in kinds= fstype rc=0 nl='
+'
+  [ -n "$pkg" ] || { echo "usage: sd-redirect check <pkg>"; return 1; }
+  load_conf
+  for k in ${2:-$KINDS}; do
+    in=$(int_dir "$k" "$pkg")
+    [ -d "$in" ] || continue
+    if [ "$(dev "$in")" != "$(dev "/data/media/$U")" ]; then
+      echo "skipped $k: internal folder is currently redirected (migrate checks it again after unmounting)"
+      continue
+    fi
+    kinds="$kinds $k"
+  done
+  [ -n "$kinds" ] || { echo "OK: $pkg has no internal data to check"; return 0; }
+  uuid=$(entry_uuid "$pkg")
+  [ -n "$uuid" ] && [ "$uuid" != - ] || uuid=$(sd_uuid)
+  fstype=$(awk -v m="/mnt/media_rw/$uuid" '$2 == m { print $3; exit }' /proc/mounts)
+  cd "/data/media/$U/Android" || return 1
+
+  { find_kinds "$pkg" "$kinds" -name "*$nl*"
+    find_kinds "$pkg" "$kinds" | awk -F/ '$NF ~ /[[:cntrl:]"*:<>?|\\]/'
+  } | check_report "names with characters exFAT forbids: \" * : < > ? | \\ or control characters" || rc=1
+  find_kinds "$pkg" "$kinds" -name '*.' \
+    | check_report "names ending with '.' (the exFAT driver strips the dot)" || rc=1
+  find_kinds "$pkg" "$kinds" \
+    | awk '{ k = tolower($0); if (k in seen) print seen[k] "  <->  " $0; else seen[k] = $0 }' \
+    | check_report "names that differ only in upper/lower case (exFAT is case-insensitive)" || rc=1
+  find_kinds "$pkg" "$kinds" ! -type f ! -type d \
+    | check_report "symlinks / special files (exFAT stores only files and folders)" || rc=1
+  if [ "$fstype" = vfat ]; then
+    find_kinds "$pkg" "$kinds" -type f -size +4194303k | check_report "files of 4 GiB or more (FAT32 limit)" || rc=1
+  fi
+  [ $rc = 0 ] && echo "OK: all names and file types can be stored on ${fstype:-the SD card}"
+  return $rc
+}
+
+# kb_need <dir> <cluster bytes>: KB a tree takes when every file and folder occupies whole clusters
+kb_need() {
+  { find "$1" -mindepth 1 -type d | sed 's/.*/0/'; find "$1" -type f -exec /system/bin/stat -c %s {} +; } \
+    | awk -v c="$2" '{ n += (int(($1 + c - 1) / c) + ($1 == 0)) * c } END { printf "%.0f", n / 1024 }'
+}
+add_kb() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", (a > 0 ? a : 0) + (b > 0 ? b : 0) }'; }
+
+# copy_kinds <from Android dir> <to Android dir> <pkg> "<kinds>": cp each kind's folder; progress reads
+# "<cp pid> <KB of the kinds already copied>" from mjob.<pkg>.cp. Fails (cp's exit code, 130 if cancelled).
+copy_kinds() {
+  local k rc=0 done_kb=0
+  for k in $4; do
+    cancelled && return 130
+    cp -R "$1/$k/$3/." "$2/$k/$3/" &
+    echo "$! $done_kb" > "$RUN/mjob.$3.cp"
+    wait $!; rc=$?
+    [ $rc = 0 ] || return $rc
+    done_kb=$(add_kb "$done_kb" "$(du -sk "$2/$k/$3" | awk '{ print $1 }')")
+  done
+  cancelled && return 130
+  return 0
+}
+
+# verify_kinds <src Android dir> <dst Android dir> <pkg> "<kinds>" [src name] [dst name]: verify_copy each kind
+verify_kinds() {
+  local k out
+  for k in $4; do
+    out=$(verify_copy "$1/$k/$3" "$2/$k/$3" "$5" "$6") || { echo "$k: $out"; return 1; }
+    echo "$k: $out"
+  done
+}
+
+# migrate <pkg> [--delete] [--replace]: copy internal data and obb to the SD card, verify, optionally delete
+cmd_migrate() {
+  local a pkg= del= replace= bg= uuid k in out ins= full= cl need avail base cprc cout crc vout ok=
+  for a in "$@"; do
+    case $a in
+      --delete) del=1 ;;
+      --replace) replace=1 ;;
+      --bg) bg=1 ;;
+      -*) echo "unknown option: $a"; return 1 ;;
+      *) pkg=$a ;;
+    esac
+  done
+  [ -n "$pkg" ] || { echo "usage: sd-redirect migrate <pkg> [--delete] [--replace] [--bg]"; return 1; }
+  load_conf
+  uuid=$(entry_uuid "$pkg") || { echo "$pkg is not configured (sd-redirect add $pkg)"; return 1; }
+  [ "$uuid" != - ] || { echo "$pkg is not pinned to an SD card yet (run: sd-redirect start)"; return 1; }
+  sd_mounted "$uuid" || { echo "SD card $uuid is not mounted"; return 1; }
+  in=/data/media/$U/Android
+  out=/mnt/media_rw/$uuid/Android
+  migrate_claim "$pkg" || return 1
+
+  if [ -n "$bg" ]; then
+    # Detached, so the caller (WebUI) returns at once; follow it with `progress`, stop it with `cancel`.
+    rm -f "$RUN/mjob.$pkg".* "$RUN/mcancel.$pkg"
+    $SETSID /system/bin/sh "$SELF" migrate-job "$pkg" ${del:+--delete} ${replace:+--replace} \
+      </dev/null >"$RUN/mjob.$pkg.out" 2>&1 7>&- &
+    echo $! > "$RUN/mjob.$pkg.pid"
+    migrate_claimed
+    echo "migration of $pkg started"
+    return 0
+  fi
+
+  # From here on the daemon and the guard kill every process of the app until we exit.
+  MIG_PKG=$pkg; MIG_UUID=$uuid; MIG_DIR=
+  echo $$ > "$RUN/migrating.$pkg"
+  migrate_claimed
+  migrate_guard "$pkg" </dev/null >/dev/null 2>&1 &
+  GUARD=$!; echo "$GUARD" > "$RUN/mguard.$pkg"
+  trap migrate_unlock EXIT
+  trap 'exit 130' INT TERM
+  mphase start
+
+  am force-stop --user "$U" "$pkg"
+  [ "$MODE" = global ] && global_off "$pkg" "$uuid"
+  # `cancel` kills whatever we are running; until the SD folder is touched, cancelling changes nothing.
+  if cancelled; then
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    say "$pkg: migration cancelled, nothing was changed"; return 4
+  fi
+  # Never copy (or delete) through an active redirect: that would wipe the SD copy.
+  for k in $KINDS; do
+    [ -d "$in/$k/$pkg" ] || continue
+    if [ "$(dev "$in/$k/$pkg")" != "$(dev "/data/media/$U")" ]; then
+      echo "$in/$k/$pkg is still a mount point; aborting"; return 1
+    fi
+    ins="$ins $k"  # the kinds with an internal folder to copy
+  done
+  if [ -z "$ins" ]; then
+    echo "nothing to migrate (no internal data or obb folder)"
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    return 0
+  fi
+
+  echo "== checking names and file types"
+  mphase check
+  cout=$(cmd_check "$pkg"); crc=$?
+  if cancelled; then
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    say "$pkg: migration cancelled, nothing was changed"; return 4
+  fi
+  echo "$cout"
+  if [ $crc != 0 ]; then
+    echo "migration aborted, nothing was changed. Rename or remove the entries above first."
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    return 1
+  fi
+
+  for k in $KINDS; do
+    mkdir -p "$out/$k/$pkg"
+    [ -n "$(ls -A "$out/$k/$pkg" 2>/dev/null)" ] && full="$full $out/$k/$pkg"
+  done
+  if [ -n "$full" ] && [ -z "$replace" ]; then
+    echo "SD folder not empty:$full"
+    echo "Rerun with --replace to delete it and copy the internal data instead."
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    return 3
+  fi
+
+  # Space: every file occupies whole clusters on exFAT/FAT, so small files cost more than on f2fs/ext4.
+  mphase space
+  cl=$(/system/bin/stat -f -c %S "/mnt/media_rw/$uuid" 2>/dev/null)
+  [ -n "$cl" ] && [ "$cl" -gt 0 ] 2>/dev/null || cl=131072
+  need=0
+  for k in $ins; do need=$(add_kb "$need" "$(kb_need "$in/$k/$pkg" "$cl")"); done
+  avail=$(df -k "/mnt/media_rw/$uuid" | awk 'NR == 2 { print $4 }')
+  [ -n "$replace" ] && avail=$(add_kb "$avail" "$(du_kinds "$out" "$pkg")")
+  if cancelled; then  # also catches a killed size scan, which leaves $need short
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    say "$pkg: migration cancelled, nothing was changed"; return 4
+  fi
+  if awk -v n="$need" -v a="$avail" 'BEGIN { exit !(n >= a) }'; then
+    echo "not enough space on SD: need ${need} KB, available ${avail} KB. Nothing was changed."
+    [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+    return 1
+  fi
+
+  # The SD folders change from here on, so failing or cancelling empties them and undoes the redirect.
+  if [ -n "$replace" ]; then
+    echo "== deleting the existing SD folder contents"
+    mphase clear
+    empty_kinds "$out" "$pkg"
+  fi
+  cprc=130
+  if ! cancelled; then
+    echo "== copying ${need} KB:$(for k in $ins; do printf ' Android/%s' "$k"; done) -> SD $uuid"
+    base=$(df -k "/mnt/media_rw/$uuid" | awk 'NR == 2 { print $4 }')
+    mphase copy "$need" "$base" "/mnt/media_rw/$uuid"
+    # progress reads cp's written-bytes counter from /proc/<pid>/io (fallback: drop of free space since $base)
+    copy_kinds "$in" "$out" "$pkg" "$ins"; cprc=$?
+  fi
+  if [ $cprc = 0 ] && ! cancelled; then
+    echo "== verifying"
+    mphase verify
+    vout=$(verify_kinds "$in" "$out" "$pkg" "$ins") && ok=1
+    cancelled || echo "$vout"
+  fi
+  if [ -z "$ok" ] || cancelled; then
+    mphase cleanup
+    cancelled || { [ $cprc != 0 ] && echo "copy failed (exit $cprc)"; }
+    empty_kinds "$out" "$pkg"
+    config_remove "$pkg"
+    start_daemon
+    if cancelled; then
+      say "$pkg: migration cancelled. Partial SD copy removed, redirect undone: the app uses internal storage again."
+      return 4
+    fi
+    say "$pkg: migration failed. Partial SD copy removed, redirect undone: the app uses internal storage again."
+    return 1
+  fi
+
+  # Verification compares names and sizes, which the page cache answers before the data reaches the card: flush
+  # it, so pulling the card or losing power can't take both copies once the internal one is deleted. After
+  # `mphase delete`, so `cancel` (refused from there) can't kill the sync.
+  mphase delete  # verified: too late to cancel
+  sync
+  sd_mark "$uuid" "$pkg"
+  if [ -n "$del" ]; then
+    empty_kinds "$in" "$pkg" && echo "internal copy deleted"
+  else
+    echo "internal copy kept in $in/{data,obb}/$pkg (hidden while redirected); rerun with --delete to free it"
+  fi
+  log "$pkg: migrated ${need} KB to $uuid"
+  [ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null
+  return 0
+}
+
+# migrate-back <pkg> [--replace] [--bg]: the reverse of migrate. Copy the SD data to internal storage, verify,
+# give the files to the app, then stop the redirect and delete the SD copy. Until verification succeeds the SD
+# copy is untouched and the redirect stays; failing or cancelling only removes the partial internal copy.
+cmd_migrate_back() {
+  local a pkg= replace= bg= uuid k in out outs= full= auid gid cl need avail base cprc vout ok= restore
+  for a in "$@"; do
+    case $a in
+      --replace) replace=1 ;;
+      --bg) bg=1 ;;
+      --back) ;;
+      -*) echo "unknown option: $a"; return 1 ;;
+      *) pkg=$a ;;
+    esac
+  done
+  [ -n "$pkg" ] || { echo "usage: sd-redirect migrate-back <pkg> [--replace] [--bg]"; return 1; }
+  load_conf
+  uuid=$(entry_uuid "$pkg") || { echo "$pkg is not configured"; return 1; }
+  [ "$uuid" != - ] || { echo "$pkg is not pinned to an SD card yet (run: sd-redirect start)"; return 1; }
+  sd_mounted "$uuid" || { echo "SD card $uuid is not mounted"; return 1; }
+  in=/data/media/$U/Android
+  out=/mnt/media_rw/$uuid/Android
+  # the app's uid owns its internal Android/{data,obb} folders; files copied as root must be handed over to it
+  auid=$(/system/bin/stat -c %u "/data/user/$U/$pkg" 2>/dev/null)
+  [ -n "$auid" ] && [ "$auid" != 0 ] || { echo "$pkg is not installed"; return 1; }
+  migrate_claim "$pkg" || return 1
+  for k in $KINDS; do
+    [ -n "$(ls -A "$out/$k/$pkg" 2>/dev/null)" ] && outs="$outs $k"  # the kinds with SD data to copy
+  done
+  [ -n "$outs" ] || { migrate_claimed; echo "nothing to move back: $out/{data,obb}/$pkg are empty"; return 1; }
+
+  if [ -n "$bg" ]; then
+    rm -f "$RUN/mjob.$pkg".* "$RUN/mcancel.$pkg"
+    $SETSID /system/bin/sh "$SELF" migrate-job "$pkg" --back ${replace:+--replace} \
+      </dev/null >"$RUN/mjob.$pkg.out" 2>&1 7>&- &
+    echo $! > "$RUN/mjob.$pkg.pid"
+    migrate_claimed
+    echo "moving $pkg back started"
+    return 0
+  fi
+
+  MIG_PKG=$pkg; MIG_UUID=$uuid; MIG_DIR=back
+  echo $$ > "$RUN/migrating.$pkg"
+  migrate_claimed
+  migrate_guard "$pkg" </dev/null >/dev/null 2>&1 &
+  GUARD=$!; echo "$GUARD" > "$RUN/mguard.$pkg"
+  trap migrate_unlock EXIT
+  trap 'exit 130' INT TERM
+  mphase start
+  # every early exit keeps the redirect: put the global mount back
+  restore='[ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null'
+
+  am force-stop --user "$U" "$pkg"
+  [ "$MODE" = global ] && global_off "$pkg" "$uuid"
+  if cancelled; then eval "$restore"; say "$pkg: moving back cancelled, nothing was changed"; return 4; fi
+  # Never copy into an active redirect: that would copy the SD folder onto itself.
+  for k in $KINDS; do
+    if [ -e "$in/$k/$pkg" ] && [ "$(dev "$in/$k/$pkg")" != "$(dev "/data/media/$U")" ]; then
+      echo "$in/$k/$pkg is still a mount point; aborting"; eval "$restore"; return 1
+    fi
+  done
+  for k in $KINDS; do
+    if [ ! -d "$in/$k/$pkg" ]; then
+      mkdir -p "$in/$k/$pkg" && chown "$auid:$(kind_gid "$k")" "$in/$k/$pkg" && chmod 2770 "$in/$k/$pkg" \
+        || { echo "could not create $in/$k/$pkg"; eval "$restore"; return 1; }
+    fi
+    [ -n "$(ls -A "$in/$k/$pkg" 2>/dev/null)" ] && full="$full $in/$k/$pkg"
+  done
+  if [ -n "$full" ] && [ -z "$replace" ]; then
+    echo "internal folder not empty:$full"
+    echo "Rerun with --replace to delete it and copy the SD data instead."
+    eval "$restore"; return 3
+  fi
+
+  mphase space
+  cl=$(/system/bin/stat -f -c %S /data 2>/dev/null)
+  [ -n "$cl" ] && [ "$cl" -gt 0 ] 2>/dev/null || cl=4096
+  need=0
+  for k in $outs; do need=$(add_kb "$need" "$(kb_need "$out/$k/$pkg" "$cl")"); done
+  avail=$(df -k /data | awk 'NR == 2 { print $4 }')
+  [ -n "$replace" ] && avail=$(add_kb "$avail" "$(du_kinds "$in" "$pkg")")
+  if cancelled; then eval "$restore"; say "$pkg: moving back cancelled, nothing was changed"; return 4; fi
+  # keep 1 GB free: a full /data breaks Android itself
+  if awk -v n="$need" -v a="$avail" 'BEGIN { exit !(n + 1048576 >= a) }'; then
+    echo "not enough internal storage: need ${need} KB plus 1 GB to spare, available ${avail} KB. Nothing was changed."
+    eval "$restore"; return 1
+  fi
+
+  # The internal folders change from here on, so failing or cancelling empties them; the redirect stays.
+  if [ -n "$replace" ]; then
+    echo "== deleting the existing internal folder contents"
+    mphase clear
+    empty_kinds "$in" "$pkg"
+  fi
+  cprc=130
+  if ! cancelled; then
+    echo "== copying ${need} KB: SD $uuid ->$(for k in $outs; do printf ' Android/%s' "$k"; done)"
+    base=$(df -k /data | awk 'NR == 2 { print $4 }')
+    mphase copy "$need" "$base" /data
+    copy_kinds "$out" "$in" "$pkg" "$outs"; cprc=$?
+  fi
+  if [ $cprc = 0 ] && ! cancelled; then
+    echo "== verifying"
+    mphase verify
+    vout=$(verify_kinds "$out" "$in" "$pkg" "$outs" SD internal) && ok=1
+    cancelled || echo "$vout"
+  fi
+  if [ -n "$ok" ] && ! cancelled; then
+    # cp ran as root: hand the files to the app and restore the SELinux labels of its folders
+    for k in $outs; do
+      gid=$(/system/bin/stat -c %g "$in/$k/$pkg")
+      chown -R "$auid:$gid" "$in/$k/$pkg" && chmod -R ug+rwX "$in/$k/$pkg" \
+        || { ok=; echo "could not give the $k files to $pkg (uid $auid)"; }
+      restorecon -R "$in/$k/$pkg" 2>/dev/null
+    done
+  fi
+  if [ -z "$ok" ] || cancelled; then
+    mphase cleanup
+    cancelled || { [ $cprc != 0 ] && echo "copy failed (exit $cprc)"; }
+    empty_kinds "$in" "$pkg"
+    eval "$restore"
+    if cancelled; then
+      say "$pkg: moving back cancelled. Partial internal copy removed, the app still uses the SD card."
+      return 4
+    fi
+    say "$pkg: moving back failed. Partial internal copy removed, the app still uses the SD card."
+    return 1
+  fi
+
+  # Verified: stop the redirect, then delete the SD copy (its marker first, so leftovers get no SD icon).
+  mphase delete
+  sync  # the internal copy must be on disk before the SD copy goes (see cmd_migrate)
+  rm -f "/mnt/media_rw/$uuid/Android/data/.sd-redirect/$pkg"
+  config_remove "$pkg"
+  load_conf
+  start_daemon
+  empty_kinds "$out" "$pkg"
+  for k in $KINDS; do rmdir "$out/$k/$pkg" 2>/dev/null; done
+  echo "SD copy deleted"
+  say "$pkg: moved ${need} KB back to internal storage, redirect stopped"
+  return 0
+}
+
+# obb_commit <SD obb dir> <stage> <pkg>: move verified staged files into <SD obb dir>/<pkg>, replacing same-name
+# entries, then delete the main/patch OBB versions the new files supersede (main.<version>.<pkg>.obb). Each move is
+# a rename on the card, so a file is either old or new, never half-written. Safe to run again after an interruption.
+obb_commit() {
+  local dst=$1/$3 stage=$2 lst=$RUN/obbcommit.$3 f rc=0
+  [ -d "$stage" ] || return 0
+  mkdir -p "$dst" || return 1
+  ( cd "$stage" && find . -mindepth 1 -maxdepth 1 ) | sed 's|^\./||' > "$lst"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -d "$dst/$f" ] && [ -d "$stage/$f" ] && rm -rf "$dst/$f"
+    mv -f "$stage/$f" "$dst/$f" || rc=1
+  done < "$lst"
+  # The Play Store names expansion files <main|patch>.<versionCode>.<pkg>.obb and deletes the old one only where it
+  # wrote the new one (internal storage), so the card still holds the outdated version.
+  ls -A "$dst" | awk -v p="$3" -v lst="$lst" '
+    function kind(s,   sfx, m) {
+      sfx = "." p ".obb"
+      if (length(s) <= length(sfx) || substr(s, length(s) - length(sfx) + 1) != sfx) return ""
+      m = substr(s, 1, length(s) - length(sfx))
+      return m ~ /^(main|patch)\.[0-9]+$/ ? m : ""
+    }
+    BEGIN {
+      while ((getline s < lst) > 0)
+        if ((m = kind(s)) != "") { split(m, a, "."); if (!(a[1] in newest) || a[2] + 0 > newest[a[1]]) newest[a[1]] = a[2] + 0 }
+    }
+    (m = kind($0)) != "" { split(m, a, "."); if ((a[1] in newest) && a[2] + 0 < newest[a[1]]) print }' > "$lst.old"
+  while IFS= read -r f; do
+    [ -n "$f" ] && rm -f "$dst/$f" && echo "removed outdated $f"
+  done < "$lst.old"
+  rm -f "$lst" "$lst.old"
+  [ $rc = 0 ] && rmdir "$stage" 2>/dev/null
+  return $rc
+}
+
+# migrate-obb <pkg> [--bg]: move OBB files that appeared in a redirected app's internal obb folder (a Play Store
+# download, hidden by the redirect) into its SD obb folder. Nothing else on the card is touched, and the redirect
+# always stays. The files are copied into a staging folder on the card (Android/obb/.sd-redirect/<pkg>) and verified;
+# only then are they moved into place (obb_commit) and deleted internally.
+cmd_migrate_obb() {
+  local a pkg= bg= uuid in sdo stage cl need avail base cprc cout crc vout ok= restore
+  for a in "$@"; do
+    case $a in
+      --bg) bg=1 ;;
+      --obb) ;;
+      -*) echo "unknown option: $a"; return 1 ;;
+      *) pkg=$a ;;
+    esac
+  done
+  [ -n "$pkg" ] || { echo "usage: sd-redirect migrate-obb <pkg> [--bg]"; return 1; }
+  load_conf
+  uuid=$(entry_uuid "$pkg") || { echo "$pkg is not configured"; return 1; }
+  [ "$uuid" != - ] || { echo "$pkg is not pinned to an SD card yet (run: sd-redirect start)"; return 1; }
+  sd_mounted "$uuid" || { echo "SD card $uuid is not mounted"; return 1; }
+  in=$(int_dir obb "$pkg")
+  sdo=/mnt/media_rw/$uuid/Android/obb
+  stage=$sdo/.sd-redirect/$pkg
+  migrate_claim "$pkg" || return 1
+
+  if [ -n "$bg" ]; then
+    rm -f "$RUN/mjob.$pkg".* "$RUN/mcancel.$pkg"
+    $SETSID /system/bin/sh "$SELF" migrate-job "$pkg" --obb </dev/null >"$RUN/mjob.$pkg.out" 2>&1 7>&- &
+    echo $! > "$RUN/mjob.$pkg.pid"
+    migrate_claimed
+    echo "moving new OBB files of $pkg started"
+    return 0
+  fi
+
+  MIG_PKG=$pkg; MIG_UUID=$uuid; MIG_DIR=obb
+  echo $$ > "$RUN/migrating.$pkg"
+  migrate_claimed
+  migrate_guard "$pkg" </dev/null >/dev/null 2>&1 &
+  GUARD=$!; echo "$GUARD" > "$RUN/mguard.$pkg"
+  trap migrate_unlock EXIT
+  trap 'exit 130' INT TERM
+  mphase start
+  # the redirect stays whatever happens: every exit puts the global mount back
+  restore='[ "$MODE" = global ] && global_on "$pkg" "$uuid" >/dev/null'
+
+  am force-stop --user "$U" "$pkg"
+  [ "$MODE" = global ] && global_off "$pkg" "$uuid"
+  if cancelled; then eval "$restore"; say "$pkg: moving new OBB files cancelled, nothing was changed"; return 4; fi
+  if [ -d "$in" ] && [ "$(dev "$in")" != "$(dev "/data/media/$U")" ]; then
+    echo "$in is still a mount point; aborting"; eval "$restore"; return 1
+  fi
+  if [ -z "$(ls -A "$in" 2>/dev/null)" ]; then
+    echo "nothing to move: $in is empty"; eval "$restore"; return 0
+  fi
+
+  echo "== checking names and file types"
+  mphase check
+  cout=$(cmd_check "$pkg" obb); crc=$?
+  if cancelled; then eval "$restore"; say "$pkg: moving new OBB files cancelled, nothing was changed"; return 4; fi
+  echo "$cout"
+  if [ $crc != 0 ]; then
+    echo "aborted, nothing was changed. Rename or remove the entries above first."
+    eval "$restore"; return 1
+  fi
+
+  # Space: the old versions are deleted only after the new files are in place, so they must fit next to them.
+  mphase space
+  cl=$(/system/bin/stat -f -c %S "/mnt/media_rw/$uuid" 2>/dev/null)
+  [ -n "$cl" ] && [ "$cl" -gt 0 ] 2>/dev/null || cl=131072
+  need=$(kb_need "$in" "$cl")
+  avail=$(df -k "/mnt/media_rw/$uuid" | awk 'NR == 2 { print $4 }')
+  if cancelled; then eval "$restore"; say "$pkg: moving new OBB files cancelled, nothing was changed"; return 4; fi
+  if awk -v n="$need" -v a="$avail" 'BEGIN { exit !(n >= a) }'; then
+    echo "not enough space on SD: need ${need} KB, available ${avail} KB. Nothing was changed."
+    eval "$restore"; return 1
+  fi
+
+  # Until verification only the staging folder changes; failing or cancelling deletes it.
+  rm -rf "$stage"
+  mkdir -p "$stage" || { echo "could not create $stage"; eval "$restore"; return 1; }
+  cprc=130
+  if ! cancelled; then
+    echo "== copying ${need} KB: Android/obb -> SD $uuid"
+    base=$(df -k "/mnt/media_rw/$uuid" | awk 'NR == 2 { print $4 }')
+    mphase copy "$need" "$base" "/mnt/media_rw/$uuid"
+    cp -R "$in/." "$stage/" &
+    echo "$! 0" > "$RUN/mjob.$pkg.cp"
+    wait $!; cprc=$?
+  fi
+  if [ $cprc = 0 ] && ! cancelled; then
+    echo "== verifying"
+    mphase verify
+    vout=$(verify_copy "$in" "$stage") && ok=1
+    cancelled || echo "obb: $vout"
+  fi
+  if [ -z "$ok" ] || cancelled; then
+    mphase cleanup
+    cancelled || { [ $cprc != 0 ] && echo "copy failed (exit $cprc)"; }
+    rm -rf "$stage"
+    eval "$restore"
+    if cancelled; then
+      say "$pkg: moving new OBB files cancelled. Partial copy removed, nothing else changed."
+      return 4
+    fi
+    say "$pkg: moving new OBB files failed. Partial copy removed, nothing else changed."
+    return 1
+  fi
+
+  mphase commit  # verified: too late to cancel
+  sync  # the staged files must be on the card before they replace the old ones (see cmd_migrate)
+  echo "== moving the new files into place"
+  if ! obb_commit "$sdo" "$stage" "$pkg"; then
+    say "$pkg: could not move every new OBB file into place; the internal copy is kept, move it again"
+    eval "$restore"; return 1
+  fi
+  sync  # and the renames too, before the internal copy goes
+  mphase delete
+  find "$in" -mindepth 1 -delete >/dev/null && echo "internal copy deleted"
+  sd_mark "$uuid" "$pkg"
+  rm -f "$RUN/obbseen.$pkg" "$RUN/obbnote.$pkg"
+  say "$pkg: moved ${need} KB of new OBB files to SD $uuid"
+  eval "$restore"
+  return 0
+}
+
+# reset: back to a fresh install. Undoes every redirect and deletes config, log and all state.
+# App data (internal and on the SD card) is not touched.
+cmd_reset() {
+  local p u f
+  load_conf
+  for f in "$RUN"/migrating.*; do
+    [ -e "$f" ] || continue
+    p=${f#"$RUN"/migrating.}
+    migrating_active "$p" && { echo "a migration of $p is running; cancel it first"; return 1; }
+  done
+  stop_daemon  # first, so it can't re-mount the apps stopped below
+  while read -r p u; do
+    [ -n "$p" ] || continue
+    am force-stop --user "$U" "$p"  # also drops the per-process mounts of ns mode
+    [ "$u" != - ] && global_off "$p" "$u"
+  done <<EOF
+$ENTRIES
+EOF
+  rm -rf "$DATA_DIR" "$RUN"
+  mkdir -p "$DATA_DIR" "$RUN"
+  cp "$MODDIR/config.default" "$CONF" 2>/dev/null || : > "$CONF"
+  log "reset: all redirects undone, config and state cleared"
+  start_daemon
+  echo "reset done: no apps configured, mode ns. App data on internal storage and the SD card was left in place."
+}
+
+# cancel <pkg>: stop a running migration; it then cleans up as if the copy had failed
+cmd_cancel() {
+  local pkg=$1 ph
+  [ -n "$pkg" ] || { echo "usage: sd-redirect cancel <pkg>"; return 1; }
+  migrating_active "$pkg" || { echo "no migration of $pkg is running"; return 1; }
+  [ -f "$RUN/mcancel.$pkg" ] && { echo "already cancelling"; return 0; }
+  ph=$(awk '{ print $1; exit }' "$RUN/mjob.$pkg.phase" 2>/dev/null)
+  case $ph in commit|delete|cleanup) echo "too late to cancel (phase: $ph)"; return 1 ;; esac
+  touch "$RUN/mcancel.$pkg"
+  # kill the running step (cp, find, ...), but not the guard that keeps the app closed
+  kill_desc "$(cat "$RUN/migrating.$pkg")" "$(cat "$RUN/mguard.$pkg" 2>/dev/null)"
+  log "$pkg: migration cancel requested (phase: ${ph:-start})"
+  echo "cancelling the migration of $pkg"
+}
+
+# progress <pkg> [--clear]: line 1 "<running|done|died|none> <rc|-> <phase> <doneKB> <totalKB> <to-sd|back|obb>"
+# (the direction is only known while running),
+# then the output of a `migrate --bg` job. --clear removes a finished job's files.
+cmd_progress() {
+  local pkg=$1 f=$RUN/mjob.$1 st=none rc=- phase total base dfdir kb= cp off dir
+  [ -n "$pkg" ] || { echo "usage: sd-redirect progress <pkg> [--clear]"; return 1; }
+  if migrating_active "$pkg" || job_alive "$pkg"; then st=running
+  elif [ -f "$f.rc" ]; then st=done; rc=$(cat "$f.rc")
+  elif [ -f "$f.pid" ]; then st=died
+  fi
+  read -r phase total base dfdir 2>/dev/null < "$f.phase"
+  dir=$(awk '{ print $3; exit }' "$DATA_DIR/migration.$pkg" 2>/dev/null)
+  if [ $st = running ] && [ "$phase" = copy ]; then
+    # Bytes cp has written. The card's free space is only a fallback: on exFAT it can lag the copy
+    # (or still be rising from the --replace delete), which kept the bar at 0.
+    # mjob.<pkg>.cp: "<cp pid> <KB of the folders (data, obb) already copied>"
+    read -r cp off 2>/dev/null < "$f.cp"
+    [ -n "$cp" ] && kb=$(awk -v o="${off:-0}" '$1 == "wchar:" { printf "%.0f", o + $2 / 1024 }' "/proc/$cp/io" 2>/dev/null)
+    [ -n "$kb" ] || kb=$(df -k "$dfdir" 2>/dev/null \
+      | awk -v b="$base" 'NR == 2 { d = b - $4; printf "%.0f", d < 0 ? 0 : d }')
+  fi
+  echo "$st $rc ${phase:-start} ${kb:-0} ${total:-0} ${dir:-to-sd}"
+  cat "$f.out" 2>/dev/null
+  [ "$2" = --clear ] && [ $st != running ] && rm -f "$f".*
+  return 0
+}
+
+cmd_status() {
+  local p u k pid name sdev ddev state
+  load_conf
+  echo "mode: $MODE   config: $CONF"
+  if [ -n "$(daemon_pid)" ]; then
+    echo "daemon: running (pid $(daemon_pid), heartbeat $(hb_age)s ago$([ "$(hb_age)" -gt "$HB_MAX" ] && echo ', FROZEN'))"
+  else echo "daemon: NOT running"; fi
+  if [ -n "$(role_pid supervise)" ]; then echo "supervisor: running (pid $(role_pid supervise))"; else echo "supervisor: NOT running"; fi
+  echo "SD cards: $(awk '$2 ~ "^/mnt/media_rw/" { sub("^/mnt/media_rw/", "", $2); printf "%s ", $2 }' /proc/mounts)"
+  while read -r p u; do
+    [ -n "$p" ] || continue
+    echo
+    echo "$p -> SD $u"
+    if [ "$u" = - ]; then echo "  not pinned yet (run: sd-redirect start)"; continue; fi
+    if ! sd_mounted "$u"; then echo "  SD card missing: the app is blocked"; continue; fi
+    migrating_active "$p" && echo "  migration in progress: the app is blocked"
+    for k in $KINDS; do
+      printf '  SD %-5s  %s\n' "$k:" "$(du -sh "$(sd_dir "$u" "$k" "$p")" 2>/dev/null | cut -f1)"
+    done
+    if [ "$MODE" = global ]; then
+      global_redirected "$p" "$u" && echo "  global:   redirected" || echo "  global:   NOT redirected"
+    fi
+    for pid in $(pkg_pids "$p"); do
+      name=$(/system/bin/ps -o NAME= -p "$pid" 2>/dev/null)
+      state=
+      for k in $KINDS; do
+        sdev=$(nsx "$pid" /system/bin/stat -c %d "/storage/$u/Android/$k/$p" 2>/dev/null)
+        ddev=$(nsx "$pid" /system/bin/stat -c %d "/storage/emulated/$U/Android/$k/$p" 2>/dev/null)
+        [ -n "$sdev" ] && [ "$sdev" = "$ddev" ] && state="$state $k redirected" || state="$state $k NOT redirected"
+      done
+      echo "  process:  ${name:-$p}[$pid]$state"
+    done
+  done <<EOF
+$ENTRIES
+EOF
+}
+
+cmd_set_mode() {
+  local new=$1 p u
+  case $new in ns|global) ;; *) echo "usage: sd-redirect set-mode <ns|global>"; return 1 ;; esac
+  load_conf
+  [ "$new" = "$MODE" ] && { echo "mode is already $new"; return 0; }
+  if [ "$MODE" = global ]; then
+    while read -r p u; do
+      [ -n "$p" ] && [ "$u" != - ] && am force-stop --user "$U" "$p" && global_off "$p" "$u"
+    done <<EOF
+$ENTRIES
+EOF
+  fi
+  if grep -q '^MODE=' "$CONF"; then sed -i "s/^MODE=.*/MODE=$new/" "$CONF"
+  else sed -i "1i MODE=$new" "$CONF"; fi
+  log "mode changed: $MODE -> $new"
+  cmd_start
+}
+
+# json: machine-readable status for the WebUI
+cmd_json() {
+  local p u k sep='' sdk intk obbk state empty procs ok n pid sdev ddev f m
+  load_conf
+  printf '{"version":"%s","mode":"%s","daemon":%s,"frozen":%s,"supervisor":%s,"sd":[' \
+    "$(awk -F= '$1 == "version" { gsub(/[^A-Za-z0-9._-]/, "", $2); print $2; exit }' "$MODDIR/module.prop" 2>/dev/null)" "$MODE" \
+    "$([ -n "$(daemon_pid)" ] && echo true || echo false)" \
+    "$([ -n "$(daemon_pid)" ] && [ "$(hb_age)" -gt "$HB_MAX" ] && echo true || echo false)" \
+    "$([ -n "$(role_pid supervise)" ] && echo true || echo false)"
+  awk '$2 ~ "^/mnt/media_rw/" { sub("^/mnt/media_rw/", "", $2); printf "%s\"%s\"", (n++ ? "," : ""), $2 }' /proc/mounts
+  printf '],"apps":['
+  while read -r p u; do
+    [ -n "$p" ] || continue
+    sdk=-1; intk=-1; obbk=0; empty=true; procs=0; ok=0
+    # sizes are data + obb. In global mode an internal dir may itself be the redirect; only size it when it is not.
+    # obbk: the internal obb part alone (files the Play Store put there behind the redirect: migrate-obb)
+    for k in $KINDS; do
+      [ -d "$(int_dir "$k" "$p")" ] && [ "$(dev "$(int_dir "$k" "$p")")" = "$(dev "/data/media/$U")" ] || continue
+      n=$(du -sk "$(int_dir "$k" "$p")" 2>/dev/null | awk '{ print $1 }')
+      intk=$(add_kb "$intk" "$n")
+      [ "$k" = obb ] && [ -n "$(ls -A "$(int_dir obb "$p")" 2>/dev/null)" ] && obbk=${n:-0}
+    done
+    if [ "$u" = - ] || ! sd_mounted "$u"; then
+      state=nosd
+    else
+      sdk=$(du_kinds "/mnt/media_rw/$u/Android" "$p")
+      has_kinds "/mnt/media_rw/$u/Android" "$p" && empty=false
+      state=off
+      if migrating_active "$p"; then state=migrating
+      else
+        # a configured app's data on its card belongs to the redirect (also marks pre-marker migrations)
+        [ $empty = false ] && sd_mark "$u" "$p"
+        [ "$MODE" = global ] && global_redirected "$p" "$u" && state=on
+      fi
+      for pid in $(pkg_pids "$p"); do
+        procs=$((procs + 1))
+        n=0  # a process counts as redirected when both its data and obb folders are
+        for k in $KINDS; do
+          sdev=$(nsx "$pid" /system/bin/stat -c %d "/storage/$u/Android/$k/$p" 2>/dev/null)
+          ddev=$(nsx "$pid" /system/bin/stat -c %d "/storage/emulated/$U/Android/$k/$p" 2>/dev/null)
+          [ -n "$sdev" ] && [ "$sdev" = "$ddev" ] && n=$((n + 1))
+        done
+        [ $n = 2 ] && ok=$((ok + 1))
+      done
+    fi
+    printf '%s{"pkg":"%s","uuid":"%s","sdKB":%s,"intKB":%s,"intObbKB":%s,"sdEmpty":%s,"state":"%s","procs":%d,"redirected":%d}' \
+      "$sep" "$p" "$u" "${sdk:--1}" "${intk:--1}" "$obbk" "$empty" "$state" "$procs" "$ok"
+    sep=,
+  done <<EOF
+$ENTRIES
+EOF
+  # `migrate --bg` jobs, running or finished but not yet --clear'ed (the app may no longer be configured)
+  printf '],"jobs":['
+  sep=
+  for f in "$RUN"/mjob.*.pid; do
+    [ -e "$f" ] || continue
+    p=${f#"$RUN"/mjob.}; p=${p%.pid}
+    printf '%s"%s"' "$sep" "$p"; sep=,
+  done
+  # packages whose data on a mounted card this module moved or kept there (sd_mark), redirected or not
+  # (the app list marks them). Markers of empty or missing folders are dropped.
+  printf '],"sdData":['
+  sep=
+  for f in $(awk '$2 ~ "^/mnt/media_rw/" { print $2 }' /proc/mounts); do
+    for m in "$f"/Android/data/.sd-redirect/*; do
+      [ -f "$m" ] || continue
+      p=${m##*/}
+      case $p in *[!A-Za-z0-9._]*) continue ;; esac  # not a package name (also keeps the JSON valid)
+      if has_kinds "$f/Android" "$p"; then
+        printf '%s"%s"' "$sep" "$p"; sep=,
+      else
+        rm -f "$m"
+      fi
+    done
+  done
+  printf ']}\n'
+}
+
+cmd_diag() {
+  local p u pid
+  load_conf
+  echo "== device"
+  echo "model:     $(getprop ro.product.model) ($(getprop ro.product.device))"
+  echo "android:   $(getprop ro.build.version.release) (sdk $(getprop ro.build.version.sdk))"
+  echo "kernel:    $(uname -r)"
+  echo "selinux:   $(getenforce)"
+  echo "isolation: vold=$(getprop persist.sys.vold_app_data_isolation_enabled) zygote=$(getprop persist.zygote.app_data_isolation)"
+  echo "fuse:      passthrough=$(getprop persist.sys.fuse.passthrough.enable) bpf=$(getprop ro.fuse.bpf.is_running)"
+  echo "root:      $(ls -d /data/adb/ap /data/adb/ksu /data/adb/magisk 2>/dev/null | tr '\n' ' ')"
+  echo "busybox:   ${BB:-none (using toybox)}"
+  echo "toast dex: $([ -f "$MODDIR/bin/sd-redirect-toast.dex" ] && echo present || echo missing)"
+  $NSENTER -t 1 -m -- true && echo "nsenter:   ok" || echo "nsenter:   FAILED"
+  $FLOCK -h >/dev/null 2>&1; [ $? -lt 126 ] && echo "flock:     ok" || echo "flock:     missing (single-daemon lock falls back to pid checks)"
+  echo
+  echo "== storage mounts (init ns)"
+  grep -E ' /mnt/media_rw/| /mnt/user/| /mnt/pass_through/| /storage| /data/media' /proc/mounts
+  echo
+  echo "== Android/data and Android/obb mounts (init ns)"
+  grep -E 'Android/(data|obb)' /proc/1/mountinfo
+  echo
+  echo "== config"
+  cat "$CONF" 2>/dev/null
+  while read -r p u; do
+    [ -n "$p" ] || continue
+    for pid in $(pkg_pids "$p"); do
+      echo
+      echo "== mountinfo of $p[$pid] (storage)"
+      grep -E ' /storage' "/proc/$pid/mountinfo"
+    done
+  done <<EOF
+$ENTRIES
+EOF
+  echo
+  echo "== log (last 40 lines)"
+  tail -n 40 "$LOG" 2>/dev/null
+}
+
+# save <log|diag>: write the log (with the rotated .old part first) or the diag output to
+# Download/sd-redirect_<log|diagnostics>_<timestamp>.log on internal storage and print the path.
+# Written through the FUSE view first, so MediaProvider indexes it (Downloads app, file managers); if that fails,
+# into the lower folder with the owner/label FUSE expects, followed by a media scan request.
+cmd_save() {
+  local what name f tmp=$RUN/save.$$.tmp
+  case $1 in
+    log) what=log; { cat "$LOG.old" "$LOG"; } > "$tmp" 2>/dev/null ;;
+    diag) what=diagnostics; cmd_diag > "$tmp" 2>&1 ;;
+    *) echo "usage: sd-redirect save <log|diag>"; return 1 ;;
+  esac
+  name=sd-redirect_${what}_$(date +%Y%m%d-%H%M%S).log
+  f=/mnt/user/$U/emulated/$U/Download/$name
+  if cat "$tmp" 2>/dev/null > "$f"; then  # stderr first: it also silences the shell when $f can't be opened
+    rm -f "$tmp"
+  else
+    rm -f "$f" 2>/dev/null
+    f=/data/media/$U/Download/$name
+    mkdir -p "/data/media/$U/Download"
+    if ! mv -f "$tmp" "$f"; then rm -f "$tmp"; echo "could not write $f"; return 1; fi
+    chown 1023:1023 "$f"; chmod 664 "$f"; restorecon "$f" 2>/dev/null
+    am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file:///storage/emulated/$U/Download/$name" >/dev/null 2>&1
+  fi
+  log "saved $what to Download/$name"
+  echo "Saved to Download/$name"
+}
+
+# test-toast <start|missing> [pkg]: show one of the module's toasts now and report what happened
+cmd_test_toast() {
+  local which=$1 pkg=$2 msg
+  case $which in
+    start) msg=$MSG_STARTED ;;
+    missing) msg=$MSG ;;
+    *) echo "usage: sd-redirect test-toast <start|missing> [pkg]"; return 1 ;;
+  esac
+  case $pkg in *[!A-Za-z0-9._]*) echo "invalid package name: $pkg"; return 1 ;; esac
+  [ -n "$pkg" ] || pkg=android
+  if toast "$msg" "$pkg"; then
+    log "test toast ($which): helper exited 0"
+    echo "The toast helper finished without errors, so Android accepted the toast."
+    echo "If nothing appeared on screen, Android dropped it silently."
+  else
+    echo "The toast helper failed:"
+    tail -n 1 "$LOG"
+    return 1
+  fi
+}
+
+usage() {
+  cat <<EOF
+usage: sd-redirect <command>
+
+  status                     show configured apps and whether they are redirected
+  add <pkg> [uuid]           add an app, pinned to an SD card (default: the one mounted now)
+  remove <pkg>               stop redirecting an app (SD data stays)
+  check <pkg>                list internal files the SD card's filesystem can't store
+  migrate <pkg> [--delete] [--replace] [--bg]
+                             copy internal Android/{data,obb}/<pkg> to the SD card and verify it
+                             --delete   delete the internal copy after a verified copy
+                             --replace  allow replacing a non-empty SD folder
+                             --bg       run detached (follow with progress, stop with cancel)
+  migrate-back <pkg> [--replace] [--bg]
+                             copy the SD data back to internal storage, verify it, then stop the
+                             redirect and delete the SD copy (--replace: allow a non-empty internal folder)
+  migrate-obb <pkg> [--bg]   move new OBB files (e.g. a Play Store download hidden by the redirect) from internal
+                             storage into the app's SD obb folder; replaces same-name files and outdated versions
+  progress <pkg> [--clear]   migration phase/progress and the output of a --bg job
+  cancel <pkg>               stop a running migration (partial SD copy removed, redirect undone)
+  start | restart            (re)apply config: prepare dirs, mount (global), start the supervised daemon
+  stop                       stop the supervisor and daemon (no redirects or blocking for new app processes)
+  set-mode <ns|global>       switch mode and re-apply
+  reset                      undo all redirects, delete config/log/state (fresh install); app data stays
+  json                       status as JSON (used by the WebUI)
+  diag                       dump info for debugging
+  save <log|diag>            save the log / diag output to Download/sd-redirect_<log|diagnostics>_<time>.log
+  test-toast <start|missing> [pkg]
+                             show the start / SD-missing toast now (for debugging)
+  log                        show the log
+
+config: $CONF    log: $LOG
+EOF
+}
+
+case $1 in
+  start|restart) cmd_start ;;
+  stop) stop_daemon ;;
+  daemon) daemon ;;
+  supervise) supervise ;;
+  status) cmd_status ;;
+  add) cmd_add "$2" "$3" ;;
+  remove) cmd_remove "$2" ;;
+  check) cmd_check "$2" ;;
+  migrate) shift; cmd_migrate "$@" ;;
+  migrate-back) shift; cmd_migrate_back "$@" ;;
+  migrate-obb) shift; cmd_migrate_obb "$@" ;;
+  migrate-job) shift; migrate_job "$@" ;;
+  progress) cmd_progress "$2" "$3" ;;
+  cancel) cmd_cancel "$2" ;;
+  reset) cmd_reset ;;
+  set-mode) cmd_set_mode "$2" ;;
+  json) cmd_json ;;
+  diag) cmd_diag ;;
+  save) cmd_save "$2" ;;
+  test-toast) cmd_test_toast "$2" "$3" ;;
+  log) cat "$LOG" ;;
+  *) usage ;;
+esac
